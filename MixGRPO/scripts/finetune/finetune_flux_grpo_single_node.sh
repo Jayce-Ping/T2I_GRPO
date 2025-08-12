@@ -43,8 +43,8 @@ unified_reward_num_workers=1
 data_json_path="data/rl_embeddings/prompt.json"
 
 # MixGRPO Hyperparameters
-experiment_name="single_node_test"
-reward_model="clip_score" # "hpsv2", "clip_score" "image_reward", "pick_score", "unified_reward", "hpsv2_clip_score", "multi_reward"
+experiment_name="second_exp"
+reward_model="hpsv2" # "hpsv2", "clip_score" "image_reward", "pick_score", "unified_reward", "hpsv2_clip_score", "multi_reward"
 seed=714
 sampler_seed=7144
 training_strategy="part" # "part", "all"
@@ -77,7 +77,7 @@ dpm_solver_type="midpoint"
 
 # Single node configuration
 nnodes=1
-nproc_per_node=8  # 根据您的GPU数量调整，例如8张GPU
+nproc_per_node=8
 
 # Check available GPUs
 if command -v nvidia-smi &> /dev/null; then
@@ -94,7 +94,7 @@ fi
 echo "Starting single node training with $nproc_per_node processes"
 
 # Activate conda environment
-conda activate MixGRPO
+# conda activate MixGRPO
 
 # Set environment variables
 export WANDB_DISABLED=true

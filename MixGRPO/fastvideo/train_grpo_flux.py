@@ -274,10 +274,10 @@ def sample_reference_model(
                 image = vae.decode(latents, return_dict=False)[0]
                 decoded_image = image_processor.postprocess(
                 image)
-        image_dir = f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}/images"
-        os.makedirs(image_dir, exist_ok=True)
-        if index == 0:
-            decoded_image[0].save(f"{image_dir}/flux_{global_step}_{rank}.png")
+        # image_dir = f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}/images"
+        # os.makedirs(image_dir, exist_ok=True)
+        # if index == 0:
+        #     decoded_image[0].save(f"{image_dir}/flux_{global_step}_{rank}.png")
 
         # compute rewards
         with torch.no_grad():
