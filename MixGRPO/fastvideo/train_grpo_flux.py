@@ -13,6 +13,7 @@ import argparse
 import math
 import os
 from pathlib import Path
+import shutil
 
 import wandb.util
 from fastvideo.utils.parallel_states import (
@@ -937,8 +938,19 @@ def main(args):
             global_step += 1
             start_time = time.time()
             if step % args.checkpointing_steps == 0:
-                save_checkpoint(transformer, rank, f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}",
-                                step, epoch)
+                # Save at most 2 latest checkpoints
+                checkpoint_saving_dir = f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}"
+                os.makedirs(checkpoint_saving_dir, exist_ok=True)
+                existing_checkpoints = [
+                    checkpoint_dir for checkpoint_dir in os.listdir(checkpoint_saving_dir)
+                    if os.path.isdir(checkpoint_dir) and 'checkpoint' in checkpoint_dir
+                ]
+                if len(existing_checkpoints) >= 2:
+                    # Remove the oldest checkpoint directory
+                    existing_checkpoints.sort()
+                    shutil.rmtree(os.path.join(checkpoint_saving_dir, existing_checkpoints[0]))
+
+                save_checkpoint(transformer, rank, checkpoint_saving_dir, step, epoch)
 
                 dist.barrier()
 

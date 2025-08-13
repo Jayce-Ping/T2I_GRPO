@@ -142,7 +142,7 @@ def flux_step(
     # sigma <-> t (time step)
     # dsigma <-> dt < 0
     # delta_t <-> -dsigma > 0
-    # eta_t <-> eta (noise level)
+    # eta <-> eta_t (noise level)
     # model_output <-> u_t (velocity field)
     # latents <-> x_t
     # prev_sample <-> x_{t+dt}
