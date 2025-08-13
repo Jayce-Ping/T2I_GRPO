@@ -63,6 +63,9 @@ image_reward_weight=1.0
 pick_score_weight=1.0
 unified_reward_weight=1.0
 gradient_accumulation_steps=3
+h=1024
+w=1024
+t=1
 
 # DanceGRPO Sampling Parameters
 timestep_fraction=0.6
@@ -133,9 +136,9 @@ torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_p
     --allow_tf32 \
     --cfg 0.0 \
     --output_dir data/outputs \
-    --h 720 \
-    --w 720 \
-    --t 1 \
+    --h $h \
+    --w $w \
+    --t $t \
     --sampling_steps $sampling_steps \
     --eta $eta \
     --lr_warmup_steps 0 \

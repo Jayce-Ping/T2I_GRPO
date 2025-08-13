@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import tempfile
 
 import wandb.util
 from fastvideo.utils.parallel_states import (
@@ -195,17 +196,17 @@ def sample_reference_model(
         "sigma_schedule must have length sample_steps + 1",
     )
 
-    B = encoder_hidden_states.shape[0]
+    B = encoder_hidden_states.shape[0] # 12
     SPATIAL_DOWNSAMPLE = 8
     IN_CHANNELS = 16
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
 
-    batch_size = 1  
+    batch_size = 1
     batch_indices = torch.chunk(torch.arange(B), B // batch_size)
 
     all_latents = []
     all_log_probs = []
-    all_rewards = []  
+    all_rewards = []
     all_multi_rewards = {}
     all_image_ids = []
     if args.init_same_noise:
@@ -604,12 +605,12 @@ def train_one_step(
         if dist.get_rank() == 0:
             main_print(f"##### Optimize sampling time per step: {optimize_sampling_time / (i+1)} seconds")
 
-        if (i+1)%args.gradient_accumulation_steps==0:
+        if (i + 1) % args.gradient_accumulation_steps == 0:
             grad_norm = transformer.clip_grad_norm_(max_grad_norm)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-        if dist.get_rank()%8==0:
+        if dist.get_rank() % 8 == 0:
             print("ratio", ratio)
             print("advantage", sample["advantages"].item())
             print("final loss", loss.item())
@@ -625,6 +626,235 @@ def train_one_step(
 
     return total_loss, grad_norm.item(), policy_total_loss, kl_total_loss, total_clip_frac, gathered_reward_res
 
+
+def eval(
+    args,
+    device,
+    transformer,
+    vae,
+    reward_models,
+    reward_weights,
+    global_step,
+    eval_batch,  # 新增参数：固定为train dataloader的第一个batch
+    eval_prompts=None,
+    num_eval_samples=8,
+):
+    """
+    评估函数：在特定样本上计算reward，将输出图片与reward值通过wandb记录
+    
+    Args:
+        args: 训练参数
+        device: 设备
+        transformer: 模型
+        vae: VAE模型
+        reward_models: 奖励模型列表
+        reward_weights: 奖励模型权重
+        global_step: 全局步数
+        eval_batch: 固定的评估batch数据，来自train dataloader的第一个batch
+        eval_prompts: 评估提示词列表，如果为None则使用eval_batch中的caption
+        num_eval_samples: 每个提示词生成的样本数
+    """
+    # 只在主进程进行评估
+    if dist.get_rank() != 0:
+        return
+    
+    main_print(f"Starting evaluation at step {global_step}")
+    
+    # 设置模型为评估模式
+    transformer.eval()
+    
+    w, h = args.w, args.h
+    sample_steps = args.sampling_steps
+    sigma_schedule = torch.linspace(1, 0, args.sampling_steps + 1).to(device)
+    sigma_schedule = sd3_time_shift(args.shift, sigma_schedule)
+    
+    SPATIAL_DOWNSAMPLE = 8
+    IN_CHANNELS = 16
+    latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
+    
+    # 从eval_batch中提取数据
+    (
+        encoder_hidden_states_batch, 
+        pooled_prompt_embeds_batch, 
+        text_ids_batch,
+        caption_batch,
+    ) = eval_batch
+    
+    # 如果没有提供eval_prompts，使用batch中的caption
+    if eval_prompts is None:
+        if isinstance(caption_batch, str):
+            eval_prompts = [caption_batch]
+        elif isinstance(caption_batch, list):
+            eval_prompts = caption_batch
+        else:
+            eval_prompts = [str(caption_batch)]
+    
+    # 确保我们有足够的编码数据
+    batch_size = len(eval_prompts)
+    if encoder_hidden_states_batch.shape[0] < batch_size:
+        # 如果batch中的数据不够，重复最后一个
+        repeat_times = batch_size - encoder_hidden_states_batch.shape[0] + 1
+        encoder_hidden_states_batch = torch.cat([
+            encoder_hidden_states_batch,
+            encoder_hidden_states_batch[-1:].repeat(repeat_times, 1, 1)
+        ], dim=0)
+        pooled_prompt_embeds_batch = torch.cat([
+            pooled_prompt_embeds_batch,
+            pooled_prompt_embeds_batch[-1:].repeat(repeat_times, 1)
+        ], dim=0)
+        text_ids_batch = torch.cat([
+            text_ids_batch,
+            text_ids_batch[-1:].repeat(repeat_times, 1, 1)
+        ], dim=0)
+    
+    all_eval_results = []
+    
+    with torch.no_grad():
+        for prompt_idx, prompt in enumerate(eval_prompts):
+            main_print(f"Evaluating prompt {prompt_idx + 1}/{len(eval_prompts)}: {prompt}")
+            
+            # 使用batch中对应的编码数据
+            encoder_hidden_states = encoder_hidden_states_batch[prompt_idx:prompt_idx+1]
+            pooled_prompt_embeds = pooled_prompt_embeds_batch[prompt_idx:prompt_idx+1]
+            text_ids = text_ids_batch[prompt_idx:prompt_idx+1]
+            
+            # 为每个提示词生成多个样本
+            prompt_results = {
+                "prompt": prompt,
+                "images": [],
+                "rewards": [],
+                "individual_rewards": {}
+            }
+            
+            for sample_idx in range(num_eval_samples):
+                # 生成初始噪声
+                input_latents = torch.randn(
+                    (1, IN_CHANNELS, latent_h, latent_w),
+                    device=device,
+                    dtype=torch.bfloat16,
+                    generator=torch.Generator(device=device).manual_seed(args.seed + sample_idx if args.seed else sample_idx)
+                )
+                
+                input_latents_packed = pack_latents(input_latents, 1, IN_CHANNELS, latent_h, latent_w)
+                image_ids = prepare_latent_image_ids(1, latent_h // 2, latent_w // 2, device, torch.bfloat16)
+                
+                # 采样过程
+                with torch.autocast("cuda", torch.bfloat16):
+                    z, latents, _, _ = run_sample_step(
+                        args,
+                        input_latents_packed,
+                        tqdm(range(0, sample_steps), desc=f"Sampling {sample_idx+1}/{num_eval_samples}", leave=False),
+                        sigma_schedule,
+                        transformer,
+                        encoder_hidden_states,
+                        pooled_prompt_embeds,
+                        text_ids,
+                        image_ids,
+                        grpo_sample=False,
+                        determistic=[True] * sample_steps,  # 确定性采样用于评估
+                    )
+                
+                # 解码图像
+                vae.enable_tiling()
+                image_processor = VaeImageProcessor()
+                
+                with torch.inference_mode():
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        latents_unpacked = unpack_latents(latents, h, w, 8)
+                        latents_unpacked = (latents_unpacked / 0.3611) + 0.1159
+                        image = vae.decode(latents_unpacked, return_dict=False)[0]
+                        decoded_image = image_processor.postprocess(image)[0]
+                
+                # 计算奖励
+                images = [decoded_image]
+                prompts = [prompt]
+                rewards, successes, rewards_dict, successes_dict = compute_reward(
+                    images,
+                    prompts,
+                    reward_models,
+                    reward_weights,
+                )
+                
+                # 保存结果
+                prompt_results["images"].append(decoded_image)
+                if args.multi_reward_mix == "reward_aggr":
+                    prompt_results["rewards"].append(rewards[0])
+                elif args.multi_reward_mix == "advantage_aggr":
+                    # 计算加权平均奖励用于记录
+                    weighted_reward = sum(rewards_dict[model_name][0] * reward_weights[model_name] 
+                                        for model_name in rewards_dict.keys())
+                    prompt_results["rewards"].append(weighted_reward)
+                    
+                    # 保存各个模型的奖励
+                    for model_name, model_rewards in rewards_dict.items():
+                        if model_name not in prompt_results["individual_rewards"]:
+                            prompt_results["individual_rewards"][model_name] = []
+                        prompt_results["individual_rewards"][model_name].append(model_rewards[0])
+            
+            all_eval_results.append(prompt_results)
+    
+    # 记录到wandb
+    if dist.get_rank() == 0:
+        wandb_log_dict = {}
+        
+        for prompt_idx, result in enumerate(all_eval_results):
+            prompt = result["prompt"]
+            images = result["images"]
+            rewards = result["rewards"]
+            
+            # 记录图像
+            wandb_images = []
+            for img_idx, (img, reward) in enumerate(zip(images, rewards)):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    # Save the image in the temp file as a jpg rather than png
+                    img_path = os.path.join(tmpdir, f"sample_{img_idx+1}.jpg")
+                    img.save(img_path, format="JPEG")
+                    wandb_images.append(wandb.Image(
+                        img_path,
+                        caption=f"Sample {img_idx+1}, Reward: {reward:.4f}"
+                    ))
+            
+            wandb_log_dict[f"eval/images/prompt_{prompt_idx+1}"] = wandb_images
+            
+            # 记录奖励统计
+            avg_reward = np.mean(rewards)
+            std_reward = np.std(rewards)
+            max_reward = np.max(rewards)
+            min_reward = np.min(rewards)
+            
+            wandb_log_dict[f"eval/reward_stats/prompt_{prompt_idx+1}/mean"] = avg_reward
+            wandb_log_dict[f"eval/reward_stats/prompt_{prompt_idx+1}/std"] = std_reward
+            wandb_log_dict[f"eval/reward_stats/prompt_{prompt_idx+1}/max"] = max_reward
+            wandb_log_dict[f"eval/reward_stats/prompt_{prompt_idx+1}/min"] = min_reward
+            
+            # 如果使用多个奖励模型，记录各个模型的奖励
+            if args.multi_reward_mix == "advantage_aggr" and result["individual_rewards"]:
+                for model_name, model_rewards in result["individual_rewards"].items():
+                    avg_model_reward = np.mean(model_rewards)
+                    wandb_log_dict[f"eval/individual_rewards/prompt_{prompt_idx+1}/{model_name}"] = avg_model_reward
+        
+        # 计算全局奖励统计
+        all_rewards = [reward for result in all_eval_results for reward in result["rewards"]]
+        wandb_log_dict["eval/global_reward_mean"] = np.mean(all_rewards)
+        wandb_log_dict["eval/global_reward_std"] = np.std(all_rewards)
+        wandb_log_dict["eval/global_reward_max"] = np.max(all_rewards)
+        wandb_log_dict["eval/global_reward_min"] = np.min(all_rewards)
+        
+        # 记录提示词文本
+        prompt_table = wandb.Table(columns=["Prompt_ID", "Prompt_Text", "Avg_Reward"])
+        for prompt_idx, result in enumerate(all_eval_results):
+            avg_reward = np.mean(result["rewards"])
+            prompt_table.add_data(prompt_idx + 1, result["prompt"], avg_reward)
+        
+        wandb_log_dict["eval/prompts_table"] = prompt_table
+        
+        # 记录到wandb
+        wandb.log(wandb_log_dict, step=global_step)
+        
+        main_print(f"Evaluation completed. Global average reward: {np.mean(all_rewards):.4f}")
+    
+    # 恢复训练模式
+    transformer.train()
 
 def main(args):
     ############################# Init #############################
@@ -911,6 +1141,9 @@ def main(args):
         args.train_sp_batch_size,
     )
 
+    # Use the first batch as fixed eval data batch
+    eval_batch = next(loader)
+
     step_times = deque(maxlen=100)
 
     if args.training_strategy == "part":
@@ -936,6 +1169,19 @@ def main(args):
         
         for step in range(init_steps+1, args.max_train_steps+1):
             global_step += 1
+            # Do evaluation every args.eval_steps
+            if global_step % args.eval_steps == 0:
+                eval(
+                    args,
+                    device,
+                    transformer,
+                    vae,
+                    reward_models,
+                    eval_batch,
+                    global_step,
+                    eval_batch=eval_batch,
+                    num_eval_samples=args.num_eval_samples
+                )
             start_time = time.time()
             if step % args.checkpointing_steps == 0:
                 # Save at most 2 latest checkpoints
@@ -1538,6 +1784,20 @@ if __name__ == "__main__":
         default="heun",
         choices=["heun", "midpoint"],
         help="when dpm_solver_order is 2, the type of DPM-Solver method.",
+    )
+
+    #################### Eval #####################
+    parser.add_argument(
+        "--eval_steps",
+        type=int,
+        default=10,
+        help="Number of steps between evaluations",
+    )
+    parser.add_argument(
+        "--num_eval_samples",
+        type=int,
+        default=8,
+        help="Number of samples to use for evaluation",
     )
 
     #################### Wandb ####################

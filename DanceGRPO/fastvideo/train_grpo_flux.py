@@ -139,13 +139,13 @@ def flux_step(
     sde_solver: bool,
 ):
     # Equation (8)
-    # sigma <-> t (time step)
-    # dsigma <-> dt < 0
-    # delta_t <-> -dsigma > 0
-    # eta <-> eta_t (noise level)
-    # model_output <-> u_t (velocity field)
-    # latents <-> x_t
-    # prev_sample <-> x_{t+dt}
+    #          sigma <-> t (time step)
+    #         dsigma <-> dt < 0
+    #        delta_t <-> -dsigma > 0
+    #            eta <-> eta_t (noise level)
+    #   model_output <-> u_t (velocity field)
+    #        latents <-> x_t
+    #    prev_sample <-> x_{t+dt}
 
     sigma = sigmas[index] # e.g, 0.5
     dsigma = sigmas[index + 1] - sigma # e.g, 0.4 - 0.5 = -0.1
@@ -335,16 +335,16 @@ def sample_reference_model(
     IN_CHANNELS = 16
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
 
-    batch_size = 1  
+    batch_size = 1  #### ??????????????????? Batchsize = 1 --> It answer the following question since batchsize=1 makes no dimension issue.
     batch_indices = torch.chunk(torch.arange(B), B // batch_size)
 
     all_latents = []
     all_log_probs = []
     all_rewards = []  
     all_image_ids = []
-    if args.init_same_noise:
+    if args.init_same_noise: # This is the default setting in all scripts including DanceGRPO and MixGRPO
         input_latents = torch.randn(
-                (1, IN_CHANNELS, latent_h, latent_w),  #（c,t,h,w)
+                (1, IN_CHANNELS, latent_h, latent_w),  #（c,t,h,w) # ??? Here the dimension is (1, t, h, w)
                 device=device,
                 dtype=torch.bfloat16,
             )
@@ -356,7 +356,7 @@ def sample_reference_model(
         batch_caption = [caption[i] for i in batch_idx]
         if not args.init_same_noise:
             input_latents = torch.randn(
-                    (len(batch_idx), IN_CHANNELS, latent_h, latent_w),  #（c,t,h,w)
+                    (len(batch_idx), IN_CHANNELS, latent_h, latent_w),  #（c,t,h,w) # ??? Here the dimension is (B, t, h, w)
                     device=device,
                     dtype=torch.bfloat16,
                 )

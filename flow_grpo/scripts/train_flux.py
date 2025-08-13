@@ -1,35 +1,37 @@
-from collections import defaultdict
 import contextlib
-import os
 import datetime
-from concurrent import futures
-import time
-import json
 import hashlib
-from absl import app, flags
-from accelerate import Accelerator
-from ml_collections import config_flags
-from accelerate.utils import set_seed, ProjectConfiguration
-from accelerate.logging import get_logger
-from diffusers import FluxPipeline
-from diffusers.utils.torch_utils import is_compiled_module
+import json
 import numpy as np
+import os
+import random
+import tempfile
+import time
+import torch
+import tqdm
+import wandb
+
 import flow_grpo.prompts
 import flow_grpo.rewards
-from flow_grpo.stat_tracking import PerPromptStatTracker
+
+from absl import app, flags
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import set_seed, ProjectConfiguration
+from collections import defaultdict
+from concurrent import futures
+from diffusers import FluxPipeline
+from diffusers.utils.torch_utils import is_compiled_module
 from flow_grpo.diffusers_patch.flux_pipeline_with_logprob import pipeline_with_logprob
 from flow_grpo.diffusers_patch.sd3_sde_with_logprob import sde_step_with_logprob
 from flow_grpo.diffusers_patch.train_dreambooth_lora_flux import encode_prompt
-import torch
-import wandb
-from functools import partial
-import tqdm
-import tempfile
-from PIL import Image
-from peft import LoraConfig, get_peft_model, set_peft_model_state_dict, PeftModel
-import random
-from torch.utils.data import Dataset, DataLoader, Sampler
 from flow_grpo.ema import EMAModuleWrapper
+from flow_grpo.stat_tracking import PerPromptStatTracker
+from functools import partial
+from ml_collections import config_flags
+from peft import LoraConfig, get_peft_model, set_peft_model_state_dict, PeftModel
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader, Sampler
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
