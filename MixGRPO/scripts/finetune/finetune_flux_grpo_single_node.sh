@@ -41,11 +41,16 @@ unified_reward_default_question_type="semantic"
 unified_reward_num_workers=1
 
 # Dataset
-data_json_path="data/rl_embeddings/prompt.json"
+# data_json_path="data/rl_embeddings/prompt.json"
+data_json_path="data/rl_embeddings_ocr/prompt.json" # For ocr task
+test_data_json_path="data/rl_embeddings_ocr_test/prompt.json"
+
 
 # MixGRPO Hyperparameters
-experiment_name="exp_1_hpsv2"
-reward_model="hpsv2" # "hpsv2", "clip_score" "image_reward", "pick_score", "unified_reward", "hpsv2_clip_score", "multi_reward"
+experiment_prefix="exp_1"
+reward_model="ocr_score"
+experiment_name="${experiment_prefix}_${reward_model}"
+# "hpsv2", "clip_score" "image_reward", "ocr_score", "pick_score", "unified_reward", "hpsv2_clip_score", "multi_reward"
 seed=714
 sampler_seed=7144
 training_strategy="part" # "part", "all"
@@ -125,6 +130,7 @@ torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_p
     --vae_model_path $model_path \
     --cache_dir data/.cache \
     --data_json_path $data_json_path \
+    --test_data_json_path $test_data_json_path \
     --gradient_checkpointing \
     --train_batch_size 1 \
     --num_latent_t 1 \
@@ -135,7 +141,7 @@ torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_p
     --max_train_steps 300 \
     --learning_rate 1e-5 \
     --mixed_precision bf16 \
-    --checkpointing_steps 50 \
+    --checkpointing_steps 10 \
     --allow_tf32 \
     --cfg 0.0 \
     --output_dir data/outputs \
@@ -148,7 +154,9 @@ torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_p
     --sampler_seed $sampler_seed \
     --max_grad_norm 1.0 \
     --weight_decay 0.0001 \
-    --num_generations 12 \
+    --num_generations 16 \
+    --num_eval_samples 6 \
+    --eval_steps 10 \
     --shift 3 \
     --use_group \
     --ignore_last \

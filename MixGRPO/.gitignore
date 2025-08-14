@@ -5,7 +5,7 @@ fastvideo.egg-info
 
 # models
 data/flux
-data/rl_embeddings
+data/rl_embeddings*
 hps_ckpt
 image_reward_ckpt/.cache
 image_reward_ckpt/ImageReward.pt

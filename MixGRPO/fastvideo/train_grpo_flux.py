@@ -655,8 +655,8 @@ def evaluate(
     reward_models,
     reward_weights,
     global_step,
-    eval_batch,
-    num_eval_samples=8,
+    test_dataloader,
+    num_eval_samples=6,
 ):
     """
     Evaluate the model on the given prompts and log on wandb
@@ -688,111 +688,122 @@ def evaluate(
     IN_CHANNELS = 16
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
     
-    # Get data
-    (
-        encoder_hidden_states_batch, 
-        pooled_prompt_embeds_batch, 
-        text_ids_batch,
-        eval_prompts,
-    ) = eval_batch
     
     # This list will only be populated on rank 0
     all_eval_results_for_logging = []
-    
+
     with torch.no_grad():
-        # Iterate over prompts, each rank will process all prompts for simplicity,
-        # but only rank 0 will store results for logging.
-        for prompt_idx, prompt in enumerate(eval_prompts):
-            if rank == 0:
-                print(f"Evaluating prompt {prompt_idx + 1}/{len(eval_prompts)}: {prompt}")
-            
-            # Use the encoder_hidden_states given in the eval_batch
-            encoder_hidden_states = encoder_hidden_states_batch[prompt_idx:prompt_idx+1]
-            pooled_prompt_embeds = pooled_prompt_embeds_batch[prompt_idx:prompt_idx+1]
-            text_ids = text_ids_batch[prompt_idx:prompt_idx+1]
-            
-            # This dictionary will only be populated on rank 0
-            prompt_results_to_log = {
-                "prompt": prompt,
-                "images": [],
-                "rewards": [],
-                "individual_rewards": {}
-            }
-            
-            # All ranks participate in generation
-            for sample_idx in range(num_eval_samples):
-                # Ensure different ranks get different noise for variety, or the same for reproducibility
-                # Using rank in the seed ensures each process generates a unique image
-                seed = args.seed if args.seed is None else args.seed + rank * num_eval_samples + sample_idx
-                generator = torch.Generator(device=device).manual_seed(seed)
+        dataloader_progress = tqdm(
+            test_dataloader, 
+            desc="Evaluation Batches", 
+            disable=(rank != 0),
+            total=len(test_dataloader) if hasattr(test_dataloader, '__len__') else None
+        )
+        for eval_batch in dataloader_progress:
+            (
+                encoder_hidden_states_batch, 
+                pooled_prompt_embeds_batch, 
+                text_ids_batch,
+                eval_prompts,
+            ) = eval_batch
 
-                # Initialze the noise
-                input_latents = torch.randn(
-                    (1, IN_CHANNELS, latent_h, latent_w),
-                    device=device,
-                    dtype=torch.bfloat16,
-                    generator=generator
-                )
+            # Iterate over prompts, each rank will process all prompts for simplicity,
+            # but only rank 0 will store results for logging.
+            for prompt_idx, prompt in enumerate(eval_prompts):
                 
-                input_latents_packed = pack_latents(input_latents, 1, IN_CHANNELS, latent_h, latent_w)
-                image_ids = prepare_latent_image_ids(1, latent_h // 2, latent_w // 2, device, torch.bfloat16)
+                # Use the encoder_hidden_states given in the eval_batch
+                encoder_hidden_states = encoder_hidden_states_batch[prompt_idx:prompt_idx+1]
+                pooled_prompt_embeds = pooled_prompt_embeds_batch[prompt_idx:prompt_idx+1]
+                text_ids = text_ids_batch[prompt_idx:prompt_idx+1]
                 
-                # Sampling - ALL RANKS MUST PARTICIPATE
-                progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress for Eval", disable=(rank!=0))
-                with torch.autocast("cuda", torch.bfloat16):
-                    z, latents, _, _ = run_sample_step(
-                        args,
-                        input_latents_packed,
-                        progress_bar,
-                        sigma_schedule,
-                        transformer,
-                        encoder_hidden_states,
-                        pooled_prompt_embeds,
-                        text_ids,
-                        image_ids,
-                        grpo_sample=True,
-                        determistic=[True] * sample_steps,
+                # This dictionary will only be populated on rank 0
+                prompt_results_to_log = {
+                    "prompt": prompt,
+                    "images": [],
+                    "rewards": [],
+                    "individual_rewards": {}
+                }
+                
+                # All ranks participate in generation
+                for sample_idx in range(num_eval_samples):
+                    # Ensure different ranks get different noise for variety, or the same for reproducibility
+                    # Using rank in the seed ensures each process generates a unique image
+                    seed = args.seed if args.seed is None else args.seed + rank * num_eval_samples + sample_idx
+                    generator = torch.Generator(device=device).manual_seed(seed)
+
+                    # Initialze the noise
+                    input_latents = torch.randn(
+                        (1, IN_CHANNELS, latent_h, latent_w),
+                        device=device,
+                        dtype=torch.bfloat16,
+                        generator=generator
                     )
-                
-                # Decode the image - ALL RANKS MUST PARTICIPATE if VAE is also wrapped or uses distributed ops
-                vae.enable_tiling()
-                image_processor = VaeImageProcessor(16)
-                
-                with torch.inference_mode():
+                    
+                    input_latents_packed = pack_latents(input_latents, 1, IN_CHANNELS, latent_h, latent_w)
+                    image_ids = prepare_latent_image_ids(1, latent_h // 2, latent_w // 2, device, torch.bfloat16)
+                    
+                    # Sampling - ALL RANKS MUST PARTICIPATE
+                    progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress for Eval", disable=(rank!=0))
                     with torch.autocast("cuda", torch.bfloat16):
-                        latents_unpacked = unpack_latents(latents, h, w, 8)
-                        latents_unpacked = (latents_unpacked / 0.3611) + 0.1159
-                        image = vae.decode(latents_unpacked, return_dict=False)[0]
-                        decoded_image = image_processor.postprocess(image)[0]
+                        z, latents, _, _ = run_sample_step(
+                            args,
+                            input_latents_packed,
+                            progress_bar,
+                            sigma_schedule,
+                            transformer,
+                            encoder_hidden_states,
+                            pooled_prompt_embeds,
+                            text_ids,
+                            image_ids,
+                            grpo_sample=True,
+                            determistic=[True] * sample_steps,
+                        )
+                    
+                    # Decode the image - ALL RANKS MUST PARTICIPATE if VAE is also wrapped or uses distributed ops
+                    vae.enable_tiling()
+                    image_processor = VaeImageProcessor(16)
+                    
+                    with torch.inference_mode():
+                        with torch.autocast("cuda", torch.bfloat16):
+                            latents_unpacked = unpack_latents(latents, h, w, 8)
+                            latents_unpacked = (latents_unpacked / 0.3611) + 0.1159
+                            image = vae.decode(latents_unpacked, return_dict=False)[0]
+                            decoded_image = image_processor.postprocess(image)[0]
 
-                # If reward computation is cheap, all ranks can do it.
-                # If it's expensive or requires network access (like UnifiedRewardModel),
-                # you might need to gather images to rank 0 first.
-                # Assuming all ranks can compute reward for now.
-                rewards, _, rewards_dict, _ = compute_reward(
-                    [decoded_image],
-                    [prompt],
-                    reward_models,
-                    reward_weights if isinstance(reward_weights, dict) else {k: v for k,v in reward_weights.items()}
-                )
+                    # If reward computation is cheap, all ranks can do it.
+                    # If it's expensive or requires network access (like UnifiedRewardModel),
+                    # you might need to gather images to rank 0 first.
+                    # Assuming all ranks can compute reward for now.
+                    rewards, _, rewards_dict, _ = compute_reward(
+                        [decoded_image],
+                        [prompt],
+                        reward_models,
+                        reward_weights if isinstance(reward_weights, dict) else {k: v for k,v in reward_weights.items()}
+                    )
 
-                # Only rank 0 saves the results for logging
+                    # Only rank 0 saves the results for logging
+                    if rank == 0:
+                        prompt_results_to_log["images"].append(decoded_image)
+                        if args.multi_reward_mix == "reward_aggr":
+                            prompt_results_to_log["rewards"].append(rewards[0])
+                        elif args.multi_reward_mix == "advantage_aggr":
+                            weighted_reward = sum(rewards_dict[model_name][0] * reward_weights[model_name] 
+                                                for model_name in rewards_dict.keys())
+                            prompt_results_to_log["rewards"].append(weighted_reward)
+                            
+                            for model_name, model_rewards in rewards_dict.items():
+                                if model_name not in prompt_results_to_log["individual_rewards"]:
+                                    prompt_results_to_log["individual_rewards"][model_name] = []
+                                prompt_results_to_log["individual_rewards"][model_name].append(model_rewards[0])
+                
                 if rank == 0:
-                    prompt_results_to_log["images"].append(decoded_image)
-                    if args.multi_reward_mix == "reward_aggr":
-                        prompt_results_to_log["rewards"].append(rewards[0])
-                    elif args.multi_reward_mix == "advantage_aggr":
-                        weighted_reward = sum(rewards_dict[model_name][0] * reward_weights[model_name] 
-                                            for model_name in rewards_dict.keys())
-                        prompt_results_to_log["rewards"].append(weighted_reward)
-                        
-                        for model_name, model_rewards in rewards_dict.items():
-                            if model_name not in prompt_results_to_log["individual_rewards"]:
-                                prompt_results_to_log["individual_rewards"][model_name] = []
-                            prompt_results_to_log["individual_rewards"][model_name].append(model_rewards[0])
+                    all_eval_results_for_logging.append(prompt_results_to_log)
             
             if rank == 0:
-                all_eval_results_for_logging.append(prompt_results_to_log)
+                dataloader_progress.set_postfix({
+                    'prompts_processed': len(eval_prompts),
+                    'total_results': len(all_eval_results_for_logging)
+                })
     
     # All processes wait here until evaluation is done on all of them.
     if dist.is_initialized():
@@ -1081,11 +1092,25 @@ def main(args):
     sampler = DistributedSampler(
             train_dataset, rank=rank, num_replicas=world_size, shuffle=True, seed=args.sampler_seed
         )
-    
+
+    test_dataset = LatentDataset(args.test_data_json_path, args.num_latent_t, args.cfg)
+    test_sampler = DistributedSampler(
+            test_dataset, rank=rank, num_replicas=world_size, shuffle=False, seed=args.sampler_seed
+        )
 
     train_dataloader = DataLoader(
         train_dataset,
         sampler=sampler,
+        collate_fn=latent_collate_function,
+        pin_memory=True,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+        drop_last=True,
+    )
+
+    test_dataloader = DataLoader(
+        test_dataset,
+        sampler=test_sampler,
         collate_fn=latent_collate_function,
         pin_memory=True,
         batch_size=args.train_batch_size,
@@ -1149,8 +1174,13 @@ def main(args):
         args.train_sp_batch_size,
     )
 
-    # Use the first batch as fixed eval data batch
-    eval_batch = next(loader)
+    test_loader_sp = sp_parallel_dataloader_wrapper(
+        test_dataloader,
+        device,
+        1,
+        1,
+        1
+    )
 
     step_times = deque(maxlen=100)
 
@@ -1187,7 +1217,7 @@ def main(args):
                     reward_models,
                     reward_weights,
                     global_step,
-                    eval_batch=eval_batch,
+                    test_dataloader=test_loader_sp,
                     num_eval_samples=args.num_eval_samples
                 )
 
@@ -1275,6 +1305,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # dataset & dataloader
     parser.add_argument("--data_json_path", type=str, required=True)
+    parser.add_argument('--test_data_json_path', type=str, required=True)
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
@@ -1807,7 +1838,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_eval_samples",
         type=int,
-        default=8,
+        default=6,
         help="Number of samples to use for evaluation",
     )
 
