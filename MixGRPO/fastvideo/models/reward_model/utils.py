@@ -10,7 +10,7 @@ def _compute_single_reward(reward_model, images, input_prompts):
             successes = [1] * len(rewards)
         
         elif reward_model_name == 'CLIPScoreRewardModel':
-            rewards = reward_model(input_prompts, images)
+            rewards = reward_model(images, input_prompts)
             successes = [1] * len(rewards)
 
         elif reward_model_name == 'ImageRewardModel':
@@ -25,7 +25,9 @@ def _compute_single_reward(reward_model, images, input_prompts):
         elif reward_model_name == 'PickScoreRewardModel':
             rewards = reward_model(images, input_prompts)
             successes = [1] * len(rewards)
-
+        elif reward_model_name == 'OcrRewardModel':
+            rewards = reward_model(images, input_prompts)
+            successes = [1] * len(rewards)
         else:
             raise ValueError(f"Unknown reward model: {reward_model_name}")
 

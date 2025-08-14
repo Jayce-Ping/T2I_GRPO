@@ -67,6 +67,7 @@ from fastvideo.models.reward_model.pick_score import PickScoreRewardModel
 from fastvideo.models.reward_model.unified_reward import UnifiedRewardModel
 from fastvideo.models.reward_model.hps_score import HPSClipRewardModel
 from fastvideo.models.reward_model.clip_score import CLIPScoreRewardModel
+from fastvideo.models.reward_model.ocr_score import OcrRewardModel
 from fastvideo.models.reward_model.utils import compute_reward, balance_pos_neg
 from diffusers.utils.torch_utils import randn_tensor
 from typing import Optional
@@ -917,6 +918,10 @@ def main(args):
             http_proxy=args.pick_score_http_proxy,
             https_proxy=args.pick_score_https_proxy,
         ))
+    elif args.reward_model == "ocr_score":
+        reward_models.append(OcrRewardModel(
+            device_id=device
+        ))
     elif args.reward_model == "unified_reward":
         unified_reward_urls = args.unified_reward_url.split(",")
         
@@ -1643,7 +1648,7 @@ if __name__ == "__main__":
         "--reward_model",
         type=str,
         default="hpsv2",
-        choices=["hpsv2", "clip_score", "image_reward", "pick_score", "unified_reward", "hpsv2_clip_score", "multi_reward"],
+        choices=["hpsv2", "clip_score", "image_reward", "ocr_score", "pick_score", "unified_reward", "hpsv2_clip_score", "multi_reward"],
         help="reward model to use"
     )
     parser.add_argument(
