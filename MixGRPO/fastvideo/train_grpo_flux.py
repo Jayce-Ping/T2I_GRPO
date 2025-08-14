@@ -40,7 +40,6 @@ from fastvideo.utils.load import load_transformer
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from fastvideo.dataset.latent_flux_rl_datasets import LatentDataset, latent_collate_function
-import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from fastvideo.utils.checkpoint import (
     save_checkpoint,
@@ -209,6 +208,7 @@ def sample_reference_model(
     all_rewards = []
     all_multi_rewards = {}
     all_image_ids = []
+    all_images = []
     if args.init_same_noise:
         input_latents = torch.randn(
                 (1, IN_CHANNELS, latent_h, latent_w),  #（c,t,h,w)
@@ -267,15 +267,14 @@ def sample_reference_model(
         
         image_processor = VaeImageProcessor(16)
         rank = int(os.environ["RANK"])
-
         
         with torch.inference_mode():
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 latents = unpack_latents(latents, h, w, 8)
                 latents = (latents / 0.3611) + 0.1159
                 image = vae.decode(latents, return_dict=False)[0]
-                decoded_image = image_processor.postprocess(
-                image)
+                decoded_image = image_processor.postprocess(image)[0]
+                all_images.append(decoded_image)
         # image_dir = f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}/images"
         # os.makedirs(image_dir, exist_ok=True)
         # if index == 0:
@@ -283,7 +282,7 @@ def sample_reference_model(
 
         # compute rewards
         with torch.no_grad():
-            images = [decoded_image[0]]
+            images = [decoded_image]
             prompts = [batch_caption[0]]
             rewards, successes, rewards_dict, successes_dict = compute_reward(
                 images, 
@@ -307,14 +306,29 @@ def sample_reference_model(
     # TODO: add the logic code for verifying success
     all_latents = torch.cat(all_latents, dim=0)
     all_log_probs = torch.cat(all_log_probs, dim=0)
+    wandb_logdict = {}
     if args.multi_reward_mix == "reward_aggr":
         all_rewards_res = torch.cat(all_rewards, dim=0)
+        wandb_logdict = {
+            "reward_avg": all_rewards_res.mean().item(),
+            "reward_std": all_rewards_res.std().item()
+        }
     elif args.multi_reward_mix == "advantage_aggr":
         all_rewards_res = {}
         for model_name, model_rewards in all_multi_rewards.items():
             all_rewards_res[model_name] = torch.cat(model_rewards["rewards"], dim=0)
+            wandb_logdict[model_name + "_reward_avg"] = all_rewards_res[model_name].mean().item()
+            wandb_logdict[model_name + "_reward_std"] = all_rewards_res[model_name].std().item()
+
     all_image_ids = torch.stack(all_image_ids, dim=0)
-    
+
+    # Upload images and statatics of rewards on wandb
+    if dist.get_rank() == 0:
+        wandb.log({
+            "images": [wandb.Image(img) for img in all_images],
+            **wandb_logdict
+        }, step=global_step)
+
     return all_rewards_res, all_latents, all_log_probs, sigma_schedule, all_image_ids
 
 
@@ -417,7 +431,9 @@ def train_one_step(
         gathered_reward = gather_tensor(samples["rewards"])
 
     if dist.get_rank()==0:
-        print(f"gathered_{args.reward_model}", gathered_reward)
+        print(f"gathered_{args.reward_model}:", gathered_reward)
+        for model_name, model_rewards in gathered_reward.items():
+            print(f"{model_name}: {model_rewards.mean().item()}")
         reward_dir = f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}"
         with open(f'{reward_dir}/flux_{args.reward_model}_{args.training_strategy}_{args.experiment_name}.txt', 'a') as f: 
             if args.multi_reward_mix == "advantage_aggr":
@@ -610,12 +626,15 @@ def train_one_step(
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-        if dist.get_rank() % 8 == 0:
-            print("ratio", ratio)
-            print("advantage", sample["advantages"].item())
-            print("final loss", loss.item())
-            print("kl loss", kl_loss.item())
-        dist.barrier()
+        
+        # if dist.get_rank() % 8 == 0 and i == 0:
+        #     print("ratio", ratio)
+        #     print("advantage", sample["advantages"].item())
+        #     print("final loss", loss.item())
+        #     print("kl loss", kl_loss.item())
+
+        if dist.is_initialized():
+            dist.barrier()
 
     if args.multi_reward_mix == "advantage_aggr":
         gathered_reward_res = {}
@@ -627,7 +646,7 @@ def train_one_step(
     return total_loss, grad_norm.item(), policy_total_loss, kl_total_loss, total_clip_frac, gathered_reward_res
 
 
-def eval(
+def evaluate(
     args,
     device,
     transformer,
@@ -635,34 +654,30 @@ def eval(
     reward_models,
     reward_weights,
     global_step,
-    eval_batch,  # 新增参数：固定为train dataloader的第一个batch
-    eval_prompts=None,
+    eval_batch,
     num_eval_samples=8,
 ):
     """
-    评估函数：在特定样本上计算reward，将输出图片与reward值通过wandb记录
-    
+    Evaluate the model on the given prompts and log on wandb
+
     Args:
-        args: 训练参数
-        device: 设备
-        transformer: 模型
-        vae: VAE模型
-        reward_models: 奖励模型列表
-        reward_weights: 奖励模型权重
-        global_step: 全局步数
-        eval_batch: 固定的评估batch数据，来自train dataloader的第一个batch
-        eval_prompts: 评估提示词列表，如果为None则使用eval_batch中的caption
-        num_eval_samples: 每个提示词生成的样本数
+        args
+        device
+        transformer
+        vae
+        reward_models
+        reward_weights
+        global_step
+        eval_batch
+        num_eval_samples: generation num for each prompt
     """
-    # 只在主进程进行评估
-    if dist.get_rank() != 0:
-        return
-    
-    main_print(f"Starting evaluation at step {global_step}")
-    
-    # 设置模型为评估模式
-    transformer.eval()
-    
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    # Only print from the main process
+    if rank == 0:
+        print(f"Starting evaluation at step {global_step}")
+        
     w, h = args.w, args.h
     sample_steps = args.sampling_steps
     sigma_schedule = torch.linspace(1, 0, args.sampling_steps + 1).to(device)
@@ -672,189 +687,174 @@ def eval(
     IN_CHANNELS = 16
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
     
-    # 从eval_batch中提取数据
+    # Get data
     (
         encoder_hidden_states_batch, 
         pooled_prompt_embeds_batch, 
         text_ids_batch,
-        caption_batch,
+        eval_prompts,
     ) = eval_batch
     
-    # 如果没有提供eval_prompts，使用batch中的caption
-    if eval_prompts is None:
-        if isinstance(caption_batch, str):
-            eval_prompts = [caption_batch]
-        elif isinstance(caption_batch, list):
-            eval_prompts = caption_batch
-        else:
-            eval_prompts = [str(caption_batch)]
-    
-    # 确保我们有足够的编码数据
-    batch_size = len(eval_prompts)
-    if encoder_hidden_states_batch.shape[0] < batch_size:
-        # 如果batch中的数据不够，重复最后一个
-        repeat_times = batch_size - encoder_hidden_states_batch.shape[0] + 1
-        encoder_hidden_states_batch = torch.cat([
-            encoder_hidden_states_batch,
-            encoder_hidden_states_batch[-1:].repeat(repeat_times, 1, 1)
-        ], dim=0)
-        pooled_prompt_embeds_batch = torch.cat([
-            pooled_prompt_embeds_batch,
-            pooled_prompt_embeds_batch[-1:].repeat(repeat_times, 1)
-        ], dim=0)
-        text_ids_batch = torch.cat([
-            text_ids_batch,
-            text_ids_batch[-1:].repeat(repeat_times, 1, 1)
-        ], dim=0)
-    
-    all_eval_results = []
+    # This list will only be populated on rank 0
+    all_eval_results_for_logging = []
     
     with torch.no_grad():
+        # Iterate over prompts, each rank will process all prompts for simplicity,
+        # but only rank 0 will store results for logging.
         for prompt_idx, prompt in enumerate(eval_prompts):
-            main_print(f"Evaluating prompt {prompt_idx + 1}/{len(eval_prompts)}: {prompt}")
+            if rank == 0:
+                print(f"Evaluating prompt {prompt_idx + 1}/{len(eval_prompts)}: {prompt}")
             
-            # 使用batch中对应的编码数据
+            # Use the encoder_hidden_states given in the eval_batch
             encoder_hidden_states = encoder_hidden_states_batch[prompt_idx:prompt_idx+1]
             pooled_prompt_embeds = pooled_prompt_embeds_batch[prompt_idx:prompt_idx+1]
             text_ids = text_ids_batch[prompt_idx:prompt_idx+1]
             
-            # 为每个提示词生成多个样本
-            prompt_results = {
+            # This dictionary will only be populated on rank 0
+            prompt_results_to_log = {
                 "prompt": prompt,
                 "images": [],
                 "rewards": [],
                 "individual_rewards": {}
             }
             
+            # All ranks participate in generation
             for sample_idx in range(num_eval_samples):
-                # 生成初始噪声
+                # Ensure different ranks get different noise for variety, or the same for reproducibility
+                # Using rank in the seed ensures each process generates a unique image
+                seed = args.seed if args.seed is None else args.seed + rank * num_eval_samples + sample_idx
+                generator = torch.Generator(device=device).manual_seed(seed)
+
+                # Initialze the noise
                 input_latents = torch.randn(
                     (1, IN_CHANNELS, latent_h, latent_w),
                     device=device,
                     dtype=torch.bfloat16,
-                    generator=torch.Generator(device=device).manual_seed(args.seed + sample_idx if args.seed else sample_idx)
+                    generator=generator
                 )
                 
                 input_latents_packed = pack_latents(input_latents, 1, IN_CHANNELS, latent_h, latent_w)
                 image_ids = prepare_latent_image_ids(1, latent_h // 2, latent_w // 2, device, torch.bfloat16)
                 
-                # 采样过程
+                # Sampling - ALL RANKS MUST PARTICIPATE
+                progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress for Eval", disable=(rank!=0))
                 with torch.autocast("cuda", torch.bfloat16):
                     z, latents, _, _ = run_sample_step(
                         args,
                         input_latents_packed,
-                        tqdm(range(0, sample_steps), desc=f"Sampling {sample_idx+1}/{num_eval_samples}", leave=False),
+                        progress_bar,
                         sigma_schedule,
                         transformer,
                         encoder_hidden_states,
                         pooled_prompt_embeds,
                         text_ids,
                         image_ids,
-                        grpo_sample=False,
-                        determistic=[True] * sample_steps,  # 确定性采样用于评估
+                        grpo_sample=True,
+                        determistic=[True] * sample_steps,
                     )
                 
-                # 解码图像
+                # Decode the image - ALL RANKS MUST PARTICIPATE if VAE is also wrapped or uses distributed ops
                 vae.enable_tiling()
-                image_processor = VaeImageProcessor()
+                image_processor = VaeImageProcessor(16)
                 
                 with torch.inference_mode():
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                    with torch.autocast("cuda", torch.bfloat16):
                         latents_unpacked = unpack_latents(latents, h, w, 8)
                         latents_unpacked = (latents_unpacked / 0.3611) + 0.1159
                         image = vae.decode(latents_unpacked, return_dict=False)[0]
                         decoded_image = image_processor.postprocess(image)[0]
-                
-                # 计算奖励
-                images = [decoded_image]
-                prompts = [prompt]
-                rewards, successes, rewards_dict, successes_dict = compute_reward(
-                    images,
-                    prompts,
+
+                # If reward computation is cheap, all ranks can do it.
+                # If it's expensive or requires network access (like UnifiedRewardModel),
+                # you might need to gather images to rank 0 first.
+                # Assuming all ranks can compute reward for now.
+                rewards, _, rewards_dict, _ = compute_reward(
+                    [decoded_image],
+                    [prompt],
                     reward_models,
-                    reward_weights,
+                    reward_weights if isinstance(reward_weights, dict) else {k: v for k,v in reward_weights.items()}
                 )
-                
-                # 保存结果
-                prompt_results["images"].append(decoded_image)
-                if args.multi_reward_mix == "reward_aggr":
-                    prompt_results["rewards"].append(rewards[0])
-                elif args.multi_reward_mix == "advantage_aggr":
-                    # 计算加权平均奖励用于记录
-                    weighted_reward = sum(rewards_dict[model_name][0] * reward_weights[model_name] 
-                                        for model_name in rewards_dict.keys())
-                    prompt_results["rewards"].append(weighted_reward)
-                    
-                    # 保存各个模型的奖励
-                    for model_name, model_rewards in rewards_dict.items():
-                        if model_name not in prompt_results["individual_rewards"]:
-                            prompt_results["individual_rewards"][model_name] = []
-                        prompt_results["individual_rewards"][model_name].append(model_rewards[0])
+
+                # Only rank 0 saves the results for logging
+                if rank == 0:
+                    prompt_results_to_log["images"].append(decoded_image)
+                    if args.multi_reward_mix == "reward_aggr":
+                        prompt_results_to_log["rewards"].append(rewards[0])
+                    elif args.multi_reward_mix == "advantage_aggr":
+                        weighted_reward = sum(rewards_dict[model_name][0] * reward_weights[model_name] 
+                                            for model_name in rewards_dict.keys())
+                        prompt_results_to_log["rewards"].append(weighted_reward)
+                        
+                        for model_name, model_rewards in rewards_dict.items():
+                            if model_name not in prompt_results_to_log["individual_rewards"]:
+                                prompt_results_to_log["individual_rewards"][model_name] = []
+                            prompt_results_to_log["individual_rewards"][model_name].append(model_rewards[0])
             
-            all_eval_results.append(prompt_results)
+            if rank == 0:
+                all_eval_results_for_logging.append(prompt_results_to_log)
     
-    # 记录到wandb
-    if dist.get_rank() == 0:
-        wandb_log_dict = {}
-        
-        for prompt_idx, result in enumerate(all_eval_results):
-            prompt = result["prompt"]
-            images = result["images"]
-            rewards = result["rewards"]
+    # All processes wait here until evaluation is done on all of them.
+    if dist.is_initialized():
+        dist.barrier()
+
+    # Log on wandb - ONLY from rank 0
+    if rank == 0:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wandb_log_dict = {}
             
-            # 记录图像
-            wandb_images = []
-            for img_idx, (img, reward) in enumerate(zip(images, rewards)):
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    # Save the image in the temp file as a jpg rather than png
-                    img_path = os.path.join(tmpdir, f"sample_{img_idx+1}.jpg")
-                    img.save(img_path, format="JPEG")
+            for prompt_idx, result in enumerate(all_eval_results_for_logging):
+                # This part of the code remains largely the same as it was already correct for logging
+                prompt = result["prompt"]
+                images = result["images"]
+                rewards = result["rewards"]
+                
+                wandb_images = []
+
+                for img_idx, (img, reward) in enumerate(zip(images, rewards)):
+                    if img_idx >= num_eval_samples // 4:
+                        break
+                    # Save the image as jpg
+                    img_name = f"{prompt_idx+1}_{img_idx+1}.jpg"
+                    img.save(os.path.join(tmpdir, img_name), format="JPEG")
                     wandb_images.append(wandb.Image(
-                        img_path,
+                        os.path.join(tmpdir, img_name),
                         caption=f"Sample {img_idx+1}, Reward: {reward:.4f}"
                     ))
             
-            wandb_log_dict[f"eval/images/prompt_{prompt_idx+1}"] = wandb_images
+                wandb_log_dict[f"eval/images/prompt_{prompt_idx+1}"] = wandb_images
+
+                # Compute reward statistics
+                avg_reward = np.mean(rewards)
+                std_reward = np.std(rewards)
+                
+                wandb_log_dict[f"eval/reward_stats/prompt_{prompt_idx+1}/mean"] = avg_reward
+                wandb_log_dict[f"eval/reward_stats/prompt_{prompt_idx+1}/std"] = std_reward
+                
+                if args.multi_reward_mix == "advantage_aggr" and result["individual_rewards"]:
+                    for model_name, model_rewards in result["individual_rewards"].items():
+                        avg_model_reward = np.mean(model_rewards)
+                        wandb_log_dict[f"eval/individual_rewards/prompt_{prompt_idx+1}/{model_name}"] = avg_model_reward
+
+            # Compute global reward statistics
+            all_rewards = [reward for result in all_eval_results_for_logging for reward in result["rewards"]]
+            wandb_log_dict["eval/global_reward_mean"] = np.mean(all_rewards) if all_rewards else 0
+            wandb_log_dict["eval/global_reward_std"] = np.std(all_rewards) if all_rewards else 0
+
+            # Record prompt statistics
+            prompt_table = wandb.Table(columns=["Prompt_ID", "Prompt_Text", "Avg_Reward"])
+            for prompt_idx, result in enumerate(all_eval_results_for_logging):
+                avg_reward = np.mean(result["rewards"]) if result["rewards"] else 0
+                prompt_table.add_data(prompt_idx + 1, result["prompt"], avg_reward)
             
-            # 记录奖励统计
-            avg_reward = np.mean(rewards)
-            std_reward = np.std(rewards)
-            max_reward = np.max(rewards)
-            min_reward = np.min(rewards)
+            wandb_log_dict["eval/prompts_table"] = prompt_table
+        
+            wandb.log(wandb_log_dict, step=global_step)
             
-            wandb_log_dict[f"eval/reward_stats/prompt_{prompt_idx+1}/mean"] = avg_reward
-            wandb_log_dict[f"eval/reward_stats/prompt_{prompt_idx+1}/std"] = std_reward
-            wandb_log_dict[f"eval/reward_stats/prompt_{prompt_idx+1}/max"] = max_reward
-            wandb_log_dict[f"eval/reward_stats/prompt_{prompt_idx+1}/min"] = min_reward
-            
-            # 如果使用多个奖励模型，记录各个模型的奖励
-            if args.multi_reward_mix == "advantage_aggr" and result["individual_rewards"]:
-                for model_name, model_rewards in result["individual_rewards"].items():
-                    avg_model_reward = np.mean(model_rewards)
-                    wandb_log_dict[f"eval/individual_rewards/prompt_{prompt_idx+1}/{model_name}"] = avg_model_reward
-        
-        # 计算全局奖励统计
-        all_rewards = [reward for result in all_eval_results for reward in result["rewards"]]
-        wandb_log_dict["eval/global_reward_mean"] = np.mean(all_rewards)
-        wandb_log_dict["eval/global_reward_std"] = np.std(all_rewards)
-        wandb_log_dict["eval/global_reward_max"] = np.max(all_rewards)
-        wandb_log_dict["eval/global_reward_min"] = np.min(all_rewards)
-        
-        # 记录提示词文本
-        prompt_table = wandb.Table(columns=["Prompt_ID", "Prompt_Text", "Avg_Reward"])
-        for prompt_idx, result in enumerate(all_eval_results):
-            avg_reward = np.mean(result["rewards"])
-            prompt_table.add_data(prompt_idx + 1, result["prompt"], avg_reward)
-        
-        wandb_log_dict["eval/prompts_table"] = prompt_table
-        
-        # 记录到wandb
-        wandb.log(wandb_log_dict, step=global_step)
-        
-        main_print(f"Evaluation completed. Global average reward: {np.mean(all_rewards):.4f}")
+            print(f"\n\nEvaluation completed. Global average reward: {np.mean(all_rewards):.4f}")
     
-    # 恢复训练模式
-    transformer.train()
+    # Final barrier to ensure logging is complete before next training step
+    if dist.is_initialized():
+        dist.barrier()
 
 def main(args):
     ############################# Init #############################
@@ -863,9 +863,12 @@ def main(args):
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    dist.init_process_group("nccl")
+
     torch.cuda.set_device(local_rank)
     device = torch.cuda.current_device()
+
+    dist.init_process_group(backend="nccl")
+
     initialize_sequence_parallel_state(args.sp_size)
 
     # If passed along, set the training seed now. On GPU...
@@ -997,10 +1000,10 @@ def main(args):
     if total_weight > 0:
         reward_weights = {k: v/total_weight for k, v in reward_weights.items()}
     else:
-        print("No reward models activated or all weights are 0!")
+        main_print("No reward models activated or all weights are 0!")
         reward_weights = {type(model).__name__: 1.0/len(reward_models) for model in reward_models}
 
-    print(f"reward_weights: {reward_weights}")
+    main_print(f"reward_weights: {reward_weights}")
 
     ############################# Build FLUX #############################
     main_print(f"--> loading model from {args.pretrained_model_name_or_path}")
@@ -1088,7 +1091,7 @@ def main(args):
     #vae.enable_tiling()
 
     if rank <= 0:
-        project = "flux"
+        project = "MixGRPO-Flux"
         wandb_run = wandb.init(
             project=project, 
             config=args, 
@@ -1110,7 +1113,7 @@ def main(args):
     main_print(f"  Resume training from step {init_steps}")
     main_print(f"  Instantaneous batch size per device = {args.train_batch_size}")
     main_print(
-        f"  Total train batch size (w. data & sequence parallel, accumulation) = {total_batch_size}"
+        f"  Total train batch size = train_batch_size * world_size * gradient_acc_steps / sp_size * train_sp_batch_size = {args.train_batch_size} * {world_size} * {args.gradient_accumulation_steps} / {args.sp_size} * {args.train_sp_batch_size} = {total_batch_size}"
     )
     main_print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     main_print(f"  Total optimization steps per epoch = {args.max_train_steps}")
@@ -1170,18 +1173,19 @@ def main(args):
         for step in range(init_steps+1, args.max_train_steps+1):
             global_step += 1
             # Do evaluation every args.eval_steps
-            if global_step % args.eval_steps == 0:
-                eval(
+            if global_step % args.eval_steps == 0:  
+                evaluate(
                     args,
                     device,
                     transformer,
                     vae,
                     reward_models,
-                    eval_batch,
+                    reward_weights,
                     global_step,
                     eval_batch=eval_batch,
                     num_eval_samples=args.num_eval_samples
                 )
+
             start_time = time.time()
             if step % args.checkpointing_steps == 0:
                 # Save at most 2 latest checkpoints
@@ -1253,6 +1257,8 @@ def main(args):
                         log_dict[f"reward_{model_name}"] = model_rewards
                 elif args.multi_reward_mix == "reward_aggr":
                     log_dict["reward"] = reward
+
+                
 
                 wandb.log(log_dict, step=global_step)
 

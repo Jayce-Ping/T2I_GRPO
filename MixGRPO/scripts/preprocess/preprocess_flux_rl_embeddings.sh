@@ -1,7 +1,7 @@
 #!/bin/bash
 
 GPU_NUM=8 # 2,4,8
-MODEL_PATH="data/flux"
+MODEL_PATH="/raid/data_qianh/jcy/hugging/models/FLUX.1-dev"
 OUTPUT_DIR="data/rl_embeddings"
 
 torchrun --nproc_per_node=$GPU_NUM --master_port 19002 \

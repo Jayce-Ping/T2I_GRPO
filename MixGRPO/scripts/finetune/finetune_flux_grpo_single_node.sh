@@ -20,7 +20,7 @@ function find_free_port() {
 free_port=$(find_free_port)
 
 # wandb key
-wandb_key=""
+wandb_key="66795f41320baafdbf8b4a19b62dce232ded0c2e"
 
 # network proxy settings and api url
 image_reward_http_proxy=None
@@ -30,7 +30,8 @@ pick_score_https_proxy=None
 unified_reward_url=None
 
 # flux and reward models paths
-model_path="./data/flux"
+# model_path="./data/flux"
+model_path="/raid/data_qianh/jcy/hugging/models/FLUX.1-dev"
 hps_path="./hps_ckpt/HPS_v2.1_compressed.pt"
 hps_clip_path="./hps_ckpt/open_clip_pytorch_model.bin"
 clip_score_path="hf-hub:apple/DFN5B-CLIP-ViT-H-14-384"
@@ -43,7 +44,7 @@ unified_reward_num_workers=1
 data_json_path="data/rl_embeddings/prompt.json"
 
 # MixGRPO Hyperparameters
-experiment_name="second_exp"
+experiment_name="exp_1_hpsv2"
 reward_model="hpsv2" # "hpsv2", "clip_score" "image_reward", "pick_score", "unified_reward", "hpsv2_clip_score", "multi_reward"
 seed=714
 sampler_seed=7144
@@ -100,9 +101,11 @@ echo "Starting single node training with $nproc_per_node processes"
 # conda activate MixGRPO
 
 # Set environment variables
-export WANDB_DISABLED=true
+### Wandb
+export WANDB_DISABLED=false
 export WANDB_BASE_URL="https://api.wandb.ai"
-export WANDB_MODE=offline
+export WANDB_MODE=online
+export WANDB_PROJECT="MixGRPO"
 export PYTHONPATH=$PYTHONPATH:$(pwd)
 
 # Basic NCCL settings for single node (simplified)

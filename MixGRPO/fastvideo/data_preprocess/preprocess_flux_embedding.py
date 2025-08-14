@@ -90,9 +90,10 @@ def main(args):
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
-    pipe = FluxPipeline.from_pretrained("./data/flux", torch_dtype=torch.bfloat16).to(device)
+    # pipe = FluxPipeline.from_pretrained("./data/flux", torch_dtype=torch.bfloat16).to(device)
     # pipe = FluxPipeline.from_pretrained("./data/flux").to(device)
-
+    pipe = FluxPipeline.from_pretrained("/raid/data_qianh/jcy/hugging/models/FLUX.1-dev", torch_dtype=torch.bfloat16).to(device)
+    
     json_data = []
     for _, data in tqdm(enumerate(train_dataloader), disable=local_rank != 0):
         try:
