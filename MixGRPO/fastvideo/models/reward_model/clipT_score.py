@@ -89,8 +89,8 @@ class CLIPTScoreRewardModel():
     @torch.no_grad()
     def __call__(
         self, 
-        prompts: Union[str, List[str]], 
-        images: List[Image.Image]
+        images: List[Image.Image],
+        prompts: Union[str, List[str]]
     ) -> List[float]:
         if isinstance(prompts, str):
             prompts = [prompts] * len(images)

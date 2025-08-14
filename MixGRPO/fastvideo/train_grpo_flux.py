@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from typing import Optional, Union, Dict, Any, List
 
 import wandb.util
 from fastvideo.utils.parallel_states import (
@@ -293,6 +294,7 @@ def sample_reference_model(
             )
             if args.multi_reward_mix == "reward_aggr":
                 all_rewards.append(torch.tensor(rewards, device=device, dtype=torch.float32))
+            
             elif args.multi_reward_mix == "advantage_aggr":
                 for model_name, model_rewards in rewards_dict.items():
                     if model_name not in all_multi_rewards:
@@ -307,28 +309,31 @@ def sample_reference_model(
     # TODO: add the logic code for verifying success
     all_latents = torch.cat(all_latents, dim=0)
     all_log_probs = torch.cat(all_log_probs, dim=0)
-    wandb_logdict = {}
+
     if args.multi_reward_mix == "reward_aggr":
         all_rewards_res = torch.cat(all_rewards, dim=0)
-        wandb_logdict = {
-            "reward_avg": all_rewards_res.mean().item(),
-            "reward_std": all_rewards_res.std().item()
-        }
+
     elif args.multi_reward_mix == "advantage_aggr":
         all_rewards_res = {}
         for model_name, model_rewards in all_multi_rewards.items():
             all_rewards_res[model_name] = torch.cat(model_rewards["rewards"], dim=0)
-            wandb_logdict[model_name + "_reward_avg"] = all_rewards_res[model_name].mean().item()
-            wandb_logdict[model_name + "_reward_std"] = all_rewards_res[model_name].std().item()
 
     all_image_ids = torch.stack(all_image_ids, dim=0)
 
     # Upload images and statatics of rewards on wandb
-    if dist.get_rank() == 0:
-        wandb.log({
-            "images": [wandb.Image(img) for img in all_images],
-            **wandb_logdict
-        }, step=global_step)
+    # if dist.get_rank() == 0 and global_step % 2 == 0:
+    #     with tempfile.TemporaryDirectory() as tmpdir:
+    #         wandb_images = []
+    #         image_paths = [os.path.join(tmpdir, f"{i}.jpg") for i in range(len(all_images))]
+    #         for i, (img, reward) in enumerate(zip(all_images, all_rewards)):
+    #             img.save(image_paths[i], format="JPEG")
+    #             wandb_images.append(wandb.Image(img, caption=f"Reward {reward.mean().item():.2f}"))
+            
+    #         wandb.log({
+    #             "Sampling Images": wandb_images,
+    #         },
+    #         step=global_step
+    #         )
 
     return all_rewards_res, all_latents, all_log_probs, sigma_schedule, all_image_ids
 
@@ -655,8 +660,8 @@ def evaluate(
     reward_models,
     reward_weights,
     global_step,
-    test_dataloader,
-    num_eval_samples=6,
+    test_dataset,
+    num_eval_samples=6
 ):
     """
     Evaluate the model on the given prompts and log on wandb
@@ -678,7 +683,31 @@ def evaluate(
     # Only print from the main process
     if rank == 0:
         print(f"Starting evaluation at step {global_step}")
-        
+    
+
+    test_sampler = DistributedSampler(
+        test_dataset, rank=rank, num_replicas=world_size, shuffle=False, seed=args.sampler_seed
+    )
+
+    test_dataloader = DataLoader(
+        test_dataset,
+        sampler=test_sampler,
+        collate_fn=latent_collate_function,
+        pin_memory=True,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+        drop_last=True,
+        shuffle=False
+    )
+
+    test_dataloader_sp = sp_parallel_dataloader_wrapper(
+        test_dataloader,
+        device,
+        1,
+        1,
+        1
+    )
+
     w, h = args.w, args.h
     sample_steps = args.sampling_steps
     sigma_schedule = torch.linspace(1, 0, args.sampling_steps + 1).to(device)
@@ -692,14 +721,20 @@ def evaluate(
     # This list will only be populated on rank 0
     all_eval_results_for_logging = []
 
+    # Set a max_eval_num for efficiency
+    max_eval_num = 10
+    eval_cnt = 0
+
     with torch.no_grad():
         dataloader_progress = tqdm(
-            test_dataloader, 
+            test_dataloader_sp,
             desc="Evaluation Batches", 
-            disable=(rank != 0),
-            total=len(test_dataloader) if hasattr(test_dataloader, '__len__') else None
+            disable=(rank != 0)
         )
         for eval_batch in dataloader_progress:
+            eval_cnt += 1
+            if eval_cnt > max_eval_num:
+                break
             (
                 encoder_hidden_states_batch, 
                 pooled_prompt_embeds_batch, 
@@ -778,7 +813,7 @@ def evaluate(
                         [decoded_image],
                         [prompt],
                         reward_models,
-                        reward_weights if isinstance(reward_weights, dict) else {k: v for k,v in reward_weights.items()}
+                        reward_weights
                     )
 
                     # Only rank 0 saves the results for logging
@@ -804,7 +839,7 @@ def evaluate(
                     'prompts_processed': len(eval_prompts),
                     'total_results': len(all_eval_results_for_logging)
                 })
-    
+
     # All processes wait here until evaluation is done on all of them.
     if dist.is_initialized():
         dist.barrier()
@@ -812,7 +847,9 @@ def evaluate(
     # Log on wandb - ONLY from rank 0
     if rank == 0:
         with tempfile.TemporaryDirectory() as tmpdir:
-            wandb_log_dict = {}
+            wandb_log_dict : dict[str, Any]= {
+                "eval/prompt_details": []
+            }
             
             for prompt_idx, result in enumerate(all_eval_results_for_logging):
                 # This part of the code remains largely the same as it was already correct for logging
@@ -823,29 +860,29 @@ def evaluate(
                 wandb_images = []
 
                 for img_idx, (img, reward) in enumerate(zip(images, rewards)):
-                    if img_idx >= num_eval_samples // 4:
+                    if img_idx > 0: # One image per prompt
                         break
-                    # Save the image as jpg
-                    img_name = f"{prompt_idx+1}_{img_idx+1}.jpg"
+                    # Save the image as jpg for better compression
+                    img_name = f"{prompt_idx}_{img_idx}.jpg"
                     img.save(os.path.join(tmpdir, img_name), format="JPEG")
                     wandb_images.append(wandb.Image(
                         os.path.join(tmpdir, img_name),
-                        caption=f"Sample {img_idx+1}, Reward: {reward:.4f}"
+                        caption=f"Prompt {prompt_idx}, Sample {img_idx}, Reward: {reward:.4f}"
                     ))
             
-                wandb_log_dict[f"eval/images/prompt_{prompt_idx+1}"] = wandb_images
+                wandb_log_dict[f"eval_images"] = wandb_images
 
                 # Compute reward statistics
                 avg_reward = np.mean(rewards)
-                std_reward = np.std(rewards)
-                
-                wandb_log_dict[f"eval/reward_stats/prompt_{prompt_idx+1}/mean"] = avg_reward
-                wandb_log_dict[f"eval/reward_stats/prompt_{prompt_idx+1}/std"] = std_reward
-                
-                if args.multi_reward_mix == "advantage_aggr" and result["individual_rewards"]:
-                    for model_name, model_rewards in result["individual_rewards"].items():
-                        avg_model_reward = np.mean(model_rewards)
-                        wandb_log_dict[f"eval/individual_rewards/prompt_{prompt_idx+1}/{model_name}"] = avg_model_reward
+                # std_reward = np.std(rewards)
+
+                wandb_log_dict[f"eval/reward_per_prompt/{prompt_idx}"] = avg_reward
+
+                wandb_log_dict["eval/prompt_details"].append({
+                    "prompt_id": prompt_idx,
+                    'prompt': prompt,
+                    "avg_reward": avg_reward
+                })
 
             # Compute global reward statistics
             all_rewards = [reward for result in all_eval_results_for_logging for reward in result["rewards"]]
@@ -856,7 +893,7 @@ def evaluate(
             prompt_table = wandb.Table(columns=["Prompt_ID", "Prompt_Text", "Avg_Reward"])
             for prompt_idx, result in enumerate(all_eval_results_for_logging):
                 avg_reward = np.mean(result["rewards"]) if result["rewards"] else 0
-                prompt_table.add_data(prompt_idx + 1, result["prompt"], avg_reward)
+                prompt_table.add_data(prompt_idx, result["prompt"], avg_reward)
             
             wandb_log_dict["eval/prompts_table"] = prompt_table
         
@@ -1094,23 +1131,10 @@ def main(args):
         )
 
     test_dataset = LatentDataset(args.test_data_json_path, args.num_latent_t, args.cfg)
-    test_sampler = DistributedSampler(
-            test_dataset, rank=rank, num_replicas=world_size, shuffle=False, seed=args.sampler_seed
-        )
 
     train_dataloader = DataLoader(
         train_dataset,
         sampler=sampler,
-        collate_fn=latent_collate_function,
-        pin_memory=True,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-        drop_last=True,
-    )
-
-    test_dataloader = DataLoader(
-        test_dataset,
-        sampler=test_sampler,
         collate_fn=latent_collate_function,
         pin_memory=True,
         batch_size=args.train_batch_size,
@@ -1174,14 +1198,6 @@ def main(args):
         args.train_sp_batch_size,
     )
 
-    test_loader_sp = sp_parallel_dataloader_wrapper(
-        test_dataloader,
-        device,
-        1,
-        1,
-        1
-    )
-
     step_times = deque(maxlen=100)
 
     if args.training_strategy == "part":
@@ -1204,11 +1220,10 @@ def main(args):
         if isinstance(sampler, DistributedSampler):
             sampler.set_epoch(epoch) # Crucial for distributed shuffling per epoch
 
-        
         for step in range(init_steps+1, args.max_train_steps+1):
             global_step += 1
             # Do evaluation every args.eval_steps
-            if global_step % args.eval_steps == 0:  
+            if global_step % args.eval_steps == 0:
                 evaluate(
                     args,
                     device,
@@ -1217,11 +1232,10 @@ def main(args):
                     reward_models,
                     reward_weights,
                     global_step,
-                    test_dataloader=test_loader_sp,
+                    test_dataset,
                     num_eval_samples=args.num_eval_samples
                 )
 
-            start_time = time.time()
             if step % args.checkpointing_steps == 0:
                 # Save at most 2 latest checkpoints
                 checkpoint_saving_dir = f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}"
@@ -1237,8 +1251,10 @@ def main(args):
 
                 save_checkpoint(transformer, rank, checkpoint_saving_dir, step, epoch)
 
-                dist.barrier()
+                if dist.is_initialized():
+                    dist.barrier()
 
+            start_time = time.time()
             if args.training_strategy == "part":
                 timesteps_train = grpo_states.get_current_timesteps()
                 grpo_states.update_iteration()
@@ -1296,6 +1312,9 @@ def main(args):
                 
 
                 wandb.log(log_dict, step=global_step)
+        
+            if dist.is_initialized():
+                dist.barrier()
 
     if get_sequence_parallel_state():
         destroy_sequence_parallel_group()

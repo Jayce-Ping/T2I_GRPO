@@ -68,7 +68,7 @@ clip_score_weight=1.0
 image_reward_weight=1.0
 pick_score_weight=1.0
 unified_reward_weight=1.0
-gradient_accumulation_steps=3
+gradient_accumulation_steps=4
 h=1024
 w=1024
 t=1
@@ -141,7 +141,9 @@ torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_p
     --max_train_steps 300 \
     --learning_rate 1e-5 \
     --mixed_precision bf16 \
-    --checkpointing_steps 10 \
+    --checkpointing_steps 5 \
+    --num_eval_samples 6 \
+    --eval_steps 5 \
     --allow_tf32 \
     --cfg 0.0 \
     --output_dir data/outputs \
@@ -155,8 +157,6 @@ torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_p
     --max_grad_norm 1.0 \
     --weight_decay 0.0001 \
     --num_generations 16 \
-    --num_eval_samples 6 \
-    --eval_steps 10 \
     --shift 3 \
     --use_group \
     --ignore_last \

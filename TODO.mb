@@ -1,5 +1,5 @@
 # 7.17
 
-- Add eval set for MixGRPO, compute average rewards for eval set
+- Add eval set for MixGRPO, compute average rewards for eval set ✅
 
-- Add New reward model - OCR, T2IS
+- Add New reward model - OCR✅, T2IS
