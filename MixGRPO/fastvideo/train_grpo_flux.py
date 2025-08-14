@@ -138,9 +138,9 @@ def grpo_one_step(
                 device=latents.device,
                 dtype=torch.bfloat16
             ),
-            txt_ids=text_ids.repeat(encoder_hidden_states.shape[1],1), # B, L
+            txt_ids=text_ids.repeat(encoder_hidden_states.shape[1], 1), # No batch dimension is required here, same as img_ids
             pooled_projections=pooled_prompt_embeds,
-            img_ids=image_ids.squeeze(0),
+            img_ids=image_ids, # No batch dimension is required here, same as txt_ids
             joint_attention_kwargs=None,
             return_dict=False,
         )[0]
@@ -197,13 +197,16 @@ def sample_reference_model(
         "sigma_schedule must have length sample_steps + 1",
     )
 
-    B = encoder_hidden_states.shape[0] # 12
+    B = encoder_hidden_states.shape[0] # = args.num_generations * args.train_batch_size
     SPATIAL_DOWNSAMPLE = 8
     IN_CHANNELS = 16
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
 
-    batch_size = 1
-    batch_indices = torch.chunk(torch.arange(B), B // batch_size)
+    sample_batch_size = args.sample_batch_size
+    assert sample_batch_size <= args.num_generations, "sample_batch_size must be less than num_generations"
+    assert args.num_generations % sample_batch_size == 0, "num_generations must be divisible by sample_batch_size"
+
+    batch_indices = torch.chunk(torch.arange(B), B // sample_batch_size) #[[1, 2, ..., sample_batch_size]]
 
     all_latents = []
     all_log_probs = []
@@ -213,27 +216,36 @@ def sample_reference_model(
     all_images = []
     if args.init_same_noise:
         input_latents = torch.randn(
-                (1, IN_CHANNELS, latent_h, latent_w),  #（c,t,h,w)
+                (1, IN_CHANNELS, latent_h, latent_w),
                 device=device,
                 dtype=torch.bfloat16,
             )
+        # Repeat input_latents on the dim=0
+        input_latents = input_latents.repeat(sample_batch_size, 1, 1, 1)
+    
+
+    # Latest flux only requires 2-D dimensional tensor of image_ids, no batch dimention.
+    image_ids = prepare_latent_image_ids(sample_batch_size, latent_h // 2, latent_w // 2, device, torch.bfloat16)
+
     if dist.get_rank() == 0:
         sampling_time = 0
-    for index, batch_idx in enumerate(batch_indices): # len(batch_indices)=12
+    
+    for index, batch_idx in enumerate(batch_indices):
         if dist.get_rank() == 0:
             meta_sampling_time = time.time()
+        
         batch_encoder_hidden_states = encoder_hidden_states[batch_idx]
         batch_pooled_prompt_embeds = pooled_prompt_embeds[batch_idx]
-        batch_text_ids = text_ids[batch_idx]
+
         batch_caption = [caption[i] for i in batch_idx]
         if not args.init_same_noise:
             input_latents = torch.randn(
-                    (len(batch_idx), IN_CHANNELS, latent_h, latent_w),  #（c,t,h,w)
+                    (sample_batch_size, IN_CHANNELS, latent_h, latent_w),
                     device=device,
                     dtype=torch.bfloat16,
                 )
-        input_latents_new = pack_latents(input_latents, len(batch_idx), IN_CHANNELS, latent_h, latent_w)
-        image_ids = prepare_latent_image_ids(len(batch_idx), latent_h // 2, latent_w // 2, device, torch.bfloat16)
+        input_latents_new = pack_latents(input_latents, sample_batch_size, IN_CHANNELS, latent_h, latent_w)
+
         grpo_sample=True
         progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress", disable=not dist.is_initialized() or dist.get_rank() != 0)
 
@@ -253,8 +265,8 @@ def sample_reference_model(
                 transformer,
                 batch_encoder_hidden_states,
                 batch_pooled_prompt_embeds,
-                batch_text_ids,
-                image_ids,
+                text_ids, # 2D tensor
+                image_ids, # 2D tensor
                 grpo_sample,
                 determistic=determistic,
             )
@@ -267,7 +279,7 @@ def sample_reference_model(
         all_log_probs.append(batch_log_probs)
         vae.enable_tiling()
         
-        image_processor = VaeImageProcessor(16)
+        image_processor = VaeImageProcessor(do_resize=True)
         rank = int(os.environ["RANK"])
         
         with torch.inference_mode():
@@ -277,10 +289,6 @@ def sample_reference_model(
                 image = vae.decode(latents, return_dict=False)[0]
                 decoded_image = image_processor.postprocess(image)[0]
                 all_images.append(decoded_image)
-        # image_dir = f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}/images"
-        # os.makedirs(image_dir, exist_ok=True)
-        # if index == 0:
-        #     decoded_image[0].save(f"{image_dir}/flux_{global_step}_{rank}.png")
 
         # compute rewards
         with torch.no_grad():
@@ -365,6 +373,7 @@ def train_one_step(
     kl_total_loss = 0.0
     policy_total_loss = 0.0
     total_clip_frac = 0.0
+
     optimizer.zero_grad()
     (
         encoder_hidden_states, 
@@ -372,16 +381,22 @@ def train_one_step(
         text_ids,
         caption,
     ) = next(loader)
-    #device = latents.device
+
+
     if args.use_group:
         def repeat_tensor(tensor):
             if tensor is None:
                 return None
             return torch.repeat_interleave(tensor, args.num_generations, dim=0)
 
-        encoder_hidden_states = repeat_tensor(encoder_hidden_states)
-        pooled_prompt_embeds = repeat_tensor(pooled_prompt_embeds)
-        text_ids = repeat_tensor(text_ids)
+        # Note: No batch dimension required for both text_ids and img_ids, and all text_ids are the same.
+        # refer to https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_flux.py#L631
+        # line 700-711
+        # So reshape it to (1, 3) for canonicalization.
+        text_ids = text_ids[0].unsqueeze(0)
+
+        encoder_hidden_states = repeat_tensor(encoder_hidden_states) # (num_generations * train_batch_size, ...)
+        pooled_prompt_embeds = repeat_tensor(pooled_prompt_embeds) # (num_generations * train_batch_size, ...)
 
 
         if isinstance(caption, str):
@@ -393,11 +408,11 @@ def train_one_step(
 
     reward, all_latents, all_log_probs, sigma_schedule, all_image_ids = sample_reference_model(
             args,
-            device, 
+            device,
             transformer,
             vae,
-            encoder_hidden_states, 
-            pooled_prompt_embeds, 
+            encoder_hidden_states,
+            pooled_prompt_embeds,
             text_ids,
             reward_models,
             caption,
@@ -694,19 +709,21 @@ def evaluate(
         sampler=test_sampler,
         collate_fn=latent_collate_function,
         pin_memory=True,
-        batch_size=args.train_batch_size,
+        batch_size=args.test_batch_size,
         num_workers=args.dataloader_num_workers,
         drop_last=True,
         shuffle=False
     )
 
-    test_dataloader_sp = sp_parallel_dataloader_wrapper(
-        test_dataloader,
-        device,
-        1,
-        1,
-        1
-    )
+
+    # The following function is used for Sequence Parallel, for video handling. No use here.
+    # test_dataloader_sp = sp_parallel_dataloader_wrapper(
+    #     test_dataloader,
+    #     device,
+    #     args.test_batch_size,
+    #     args.sp_size,
+    #     args.test_sp_batch_size,
+    # )
 
     w, h = args.w, args.h
     sample_steps = args.sampling_steps
@@ -725,14 +742,19 @@ def evaluate(
     max_eval_num = 10
     eval_cnt = 0
 
+    # Some shared variables for the evaluation
+    image_ids = prepare_latent_image_ids(1, latent_h // 2, latent_w // 2, device, torch.bfloat16)
+
+
+    all_eval_results_for_logging = []
+
     with torch.no_grad():
         dataloader_progress = tqdm(
-            test_dataloader_sp,
+            test_dataloader,
             desc="Evaluation Batches", 
             disable=(rank != 0)
         )
         for eval_batch in dataloader_progress:
-            eval_cnt += 1
             if eval_cnt > max_eval_num:
                 break
             (
@@ -742,101 +764,104 @@ def evaluate(
                 eval_prompts,
             ) = eval_batch
 
-            # Iterate over prompts, each rank will process all prompts for simplicity,
-            # but only rank 0 will store results for logging.
-            for prompt_idx, prompt in enumerate(eval_prompts):
-                
-                # Use the encoder_hidden_states given in the eval_batch
-                encoder_hidden_states = encoder_hidden_states_batch[prompt_idx:prompt_idx+1]
-                pooled_prompt_embeds = pooled_prompt_embeds_batch[prompt_idx:prompt_idx+1]
-                text_ids = text_ids_batch[prompt_idx:prompt_idx+1]
-                
-                # This dictionary will only be populated on rank 0
-                prompt_results_to_log = {
-                    "prompt": prompt,
-                    "images": [],
-                    "rewards": [],
-                    "individual_rewards": {}
-                }
-                
-                # All ranks participate in generation
-                for sample_idx in range(num_eval_samples):
-                    # Ensure different ranks get different noise for variety, or the same for reproducibility
-                    # Using rank in the seed ensures each process generates a unique image
-                    seed = args.seed if args.seed is None else args.seed + rank * num_eval_samples + sample_idx
-                    generator = torch.Generator(device=device).manual_seed(seed)
 
-                    # Initialze the noise
-                    input_latents = torch.randn(
-                        (1, IN_CHANNELS, latent_h, latent_w),
-                        device=device,
-                        dtype=torch.bfloat16,
-                        generator=generator
-                    )
-                    
-                    input_latents_packed = pack_latents(input_latents, 1, IN_CHANNELS, latent_h, latent_w)
-                    image_ids = prepare_latent_image_ids(1, latent_h // 2, latent_w // 2, device, torch.bfloat16)
-                    
-                    # Sampling - ALL RANKS MUST PARTICIPATE
-                    progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress for Eval", disable=(rank!=0))
-                    with torch.autocast("cuda", torch.bfloat16):
-                        z, latents, _, _ = run_sample_step(
-                            args,
-                            input_latents_packed,
-                            progress_bar,
-                            sigma_schedule,
-                            transformer,
-                            encoder_hidden_states,
-                            pooled_prompt_embeds,
-                            text_ids,
-                            image_ids,
-                            grpo_sample=True,
-                            determistic=[True] * sample_steps,
-                        )
-                    
-                    # Decode the image - ALL RANKS MUST PARTICIPATE if VAE is also wrapped or uses distributed ops
-                    vae.enable_tiling()
-                    image_processor = VaeImageProcessor(16)
-                    
-                    with torch.inference_mode():
-                        with torch.autocast("cuda", torch.bfloat16):
-                            latents_unpacked = unpack_latents(latents, h, w, 8)
-                            latents_unpacked = (latents_unpacked / 0.3611) + 0.1159
-                            image = vae.decode(latents_unpacked, return_dict=False)[0]
-                            decoded_image = image_processor.postprocess(image)[0]
+            # Enough reaults
+            if len(all_eval_results_for_logging) >= max_eval_num:
+                break
 
-                    # If reward computation is cheap, all ranks can do it.
-                    # If it's expensive or requires network access (like UnifiedRewardModel),
-                    # you might need to gather images to rank 0 first.
-                    # Assuming all ranks can compute reward for now.
-                    rewards, _, rewards_dict, _ = compute_reward(
-                        [decoded_image],
-                        [prompt],
-                        reward_models,
-                        reward_weights
-                    )
+            num_prompts_in_batch = len(eval_prompts)
+            total_samples_to_generate = num_prompts_in_batch * num_eval_samples
 
-                    # Only rank 0 saves the results for logging
-                    if rank == 0:
-                        prompt_results_to_log["images"].append(decoded_image)
-                        if args.multi_reward_mix == "reward_aggr":
-                            prompt_results_to_log["rewards"].append(rewards[0])
-                        elif args.multi_reward_mix == "advantage_aggr":
-                            weighted_reward = sum(rewards_dict[model_name][0] * reward_weights[model_name] 
-                                                for model_name in rewards_dict.keys())
-                            prompt_results_to_log["rewards"].append(weighted_reward)
-                            
-                            for model_name, model_rewards in rewards_dict.items():
-                                if model_name not in prompt_results_to_log["individual_rewards"]:
-                                    prompt_results_to_log["individual_rewards"][model_name] = []
-                                prompt_results_to_log["individual_rewards"][model_name].append(model_rewards[0])
-                
-                if rank == 0:
+            generator = torch.Generator(device=device)
+            if args.seed is not None:
+                generator.manual_seed(args.seed + rank)
+
+            batched_encoder_hidden_states = encoder_hidden_states_batch.repeat_interleave(num_eval_samples, dim=0)
+            batched_pooled_prompt_embeds = pooled_prompt_embeds_batch.repeat_interleave(num_eval_samples, dim=0)
+            
+            input_latents = torch.randn(
+                (total_samples_to_generate, IN_CHANNELS, latent_h, latent_w),
+                device=device,
+                dtype=torch.bfloat16,
+                generator=generator
+            )
+
+            text_ids = text_ids_batch[0].unsqueeze(0)
+
+            input_latents_packed = pack_latents(input_latents, total_samples_to_generate, IN_CHANNELS, latent_h, latent_w)
+
+            progress_bar = tqdm(range(0, args.sampling_steps), desc="Batched Sampling for Eval", disable=(rank!=0))
+            with torch.autocast("cuda", torch.bfloat16):
+                sigma_schedule = sd3_time_shift(args.shift, torch.linspace(1, 0, args.sampling_steps + 1).to(device))
+                z, latents, _, _ = run_sample_step(
+                    args,
+                    input_latents_packed,
+                    progress_bar,
+                    sigma_schedule,
+                    transformer,
+                    batched_encoder_hidden_states,
+                    batched_pooled_prompt_embeds,
+                    text_ids,
+                    image_ids,
+                    grpo_sample=True,
+                    determistic=[True] * args.sampling_steps,
+                )
+
+            # --- Batched VAE Decoding and Reward Computation ---
+            vae.enable_tiling()
+            image_processor = VaeImageProcessor(do_resize=True)
+            
+            with torch.inference_mode():
+                with torch.autocast("cuda", torch.bfloat16):
+                    latents_unpacked = unpack_latents(latents, h, w, 8)
+                    latents_unpacked = (latents_unpacked / 0.3611) + 0.1159
+                    # Decode all images in one go
+                    images_tensor = vae.decode(latents_unpacked, return_dict=False)[0]
+                    # decoded_images = [image_processor.postprocess(img)[0] for img in images_tensor]
+                    decoded_images = image_processor.postprocess(images_tensor, output_type='pil')
+
+            # Compute rewards for the entire batch
+            batched_prompts = [prompt for prompt in eval_prompts for _ in range(num_eval_samples)]
+            rewards, _, rewards_dict, _ = compute_reward(
+                decoded_images,
+                batched_prompts,
+                reward_models,
+                reward_weights
+            )
+
+            # --- Gather and Log Results on Rank 0 ---
+            if rank == 0:
+                # Restructure flattened rewards and images for logging
+                for prompt_idx, prompt in enumerate(eval_prompts):
+                    start_idx = prompt_idx * num_eval_samples
+                    end_idx = start_idx + num_eval_samples
+                    
+                    prompt_results_to_log = {
+                        "prompt": prompt,
+                        "images": decoded_images[start_idx:end_idx],
+                        "rewards": []
+                    }
+                    
+                    # Extract rewards for this specific prompt
+                    if args.multi_reward_mix == "reward_aggr":
+                        prompt_results_to_log["rewards"] = rewards[start_idx:end_idx]
+                    elif args.multi_reward_mix == "advantage_aggr":
+                        for model_name, model_rewards in rewards_dict.items():
+                            weighted_rewards = [
+                                model_rewards[i] * reward_weights[model_name] for i in range(start_idx, end_idx)
+                            ]
+                            if not prompt_results_to_log["rewards"]:
+                                prompt_results_to_log["rewards"] = weighted_rewards
+                            else:
+                                prompt_results_to_log["rewards"] = [
+                                    sum(x) for x in zip(prompt_results_to_log["rewards"], weighted_rewards)
+                                ]
+                    
                     all_eval_results_for_logging.append(prompt_results_to_log)
             
             if rank == 0:
                 dataloader_progress.set_postfix({
-                    'prompts_processed': len(eval_prompts),
+                    'prompts_processed': num_prompts_in_batch,
                     'total_results': len(all_eval_results_for_logging)
                 })
 
@@ -845,14 +870,14 @@ def evaluate(
         dist.barrier()
 
     # Log on wandb - ONLY from rank 0
+    # (The logging logic remains the same as it was already efficient and only runs on a single rank)
     if rank == 0:
         with tempfile.TemporaryDirectory() as tmpdir:
-            wandb_log_dict : dict[str, Any]= {
+            wandb_log_dict = {
                 "eval/prompt_details": []
             }
             
             for prompt_idx, result in enumerate(all_eval_results_for_logging):
-                # This part of the code remains largely the same as it was already correct for logging
                 prompt = result["prompt"]
                 images = result["images"]
                 rewards = result["rewards"]
@@ -860,9 +885,8 @@ def evaluate(
                 wandb_images = []
 
                 for img_idx, (img, reward) in enumerate(zip(images, rewards)):
-                    if img_idx > 0: # One image per prompt
+                    if img_idx > 0: # Only one image per prompt for simplicity
                         break
-                    # Save the image as jpg for better compression
                     img_name = f"{prompt_idx}_{img_idx}.jpg"
                     img.save(os.path.join(tmpdir, img_name), format="JPEG")
                     wandb_images.append(wandb.Image(
@@ -872,36 +896,29 @@ def evaluate(
             
                 wandb_log_dict[f"eval_images"] = wandb_images
 
-                # Compute reward statistics
                 avg_reward = np.mean(rewards)
-                # std_reward = np.std(rewards)
-
                 wandb_log_dict[f"eval/reward_per_prompt/{prompt_idx}"] = avg_reward
-
                 wandb_log_dict["eval/prompt_details"].append({
                     "prompt_id": prompt_idx,
                     'prompt': prompt,
                     "avg_reward": avg_reward
                 })
 
-            # Compute global reward statistics
             all_rewards = [reward for result in all_eval_results_for_logging for reward in result["rewards"]]
             wandb_log_dict["eval/global_reward_mean"] = np.mean(all_rewards) if all_rewards else 0
             wandb_log_dict["eval/global_reward_std"] = np.std(all_rewards) if all_rewards else 0
 
-            # Record prompt statistics
-            prompt_table = wandb.Table(columns=["Prompt_ID", "Prompt_Text", "Avg_Reward"])
-            for prompt_idx, result in enumerate(all_eval_results_for_logging):
-                avg_reward = np.mean(result["rewards"]) if result["rewards"] else 0
-                prompt_table.add_data(prompt_idx, result["prompt"], avg_reward)
+            # prompt_table = wandb.Table(columns=["Prompt_ID", "Prompt_Text", "Avg_Reward"])
+            # for prompt_idx, result in enumerate(all_eval_results_for_logging):
+            #     avg_reward = np.mean(result["rewards"]) if result["rewards"] else 0
+            #     prompt_table.add_data(prompt_idx, result["prompt"], avg_reward)
             
-            wandb_log_dict["eval/prompts_table"] = prompt_table
+            # wandb_log_dict["eval/prompts_table"] = prompt_table
         
             wandb.log(wandb_log_dict, step=global_step)
             
             print(f"\n\nEvaluation completed. Global average reward: {np.mean(all_rewards):.4f}")
     
-    # Final barrier to ensure logging is complete before next training step
     if dist.is_initialized():
         dist.barrier()
 
@@ -1190,13 +1207,15 @@ def main(args):
         disable=local_rank > 0,
     )
 
-    loader = sp_parallel_dataloader_wrapper(
-        train_dataloader,
-        device,
-        args.train_batch_size,
-        args.sp_size,
-        args.train_sp_batch_size,
-    )
+    loader = iter(train_dataloader)
+    # The following code is from DanceGRPO, designed for Video input. Here we only have image-text.
+    # loader = sp_parallel_dataloader_wrapper(
+    #     train_dataloader,
+    #     device,
+    #     args.train_batch_size,
+    #     args.sp_size,
+    #     args.train_sp_batch_size,
+    # )
 
     step_times = deque(maxlen=100)
 
@@ -1223,7 +1242,7 @@ def main(args):
         for step in range(init_steps+1, args.max_train_steps+1):
             global_step += 1
             # Do evaluation every args.eval_steps
-            if global_step % args.eval_steps == 0:
+            if args.enable_eval and global_step % args.eval_steps == 0:
                 evaluate(
                     args,
                     device,
@@ -1336,6 +1355,18 @@ if __name__ == "__main__":
         type=int,
         default=16,
         help="Batch size (per device) for the training dataloader.",
+    )
+    parser.add_argument(
+        "--sample_batch_size",
+        type=int,
+        default=4,
+        help="Batch size (per device) for the sampling dataloader.",
+    )
+    parser.add_argument(
+        "--test_batch_size",
+        type=int,
+        default=4,
+        help="Batch size (per device) for the test dataloader.",
     )
     parser.add_argument(
         "--num_latent_t",
@@ -1463,6 +1494,12 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Batch size for sequence parallel training",
+    )
+    parser.add_argument(
+        "--test_sp_batch_size",
+        type=int,
+        default=1,
+        help="Batch size for sequence parallel testing",
     )
 
     parser.add_argument("--fsdp_sharding_startegy", default="full")
@@ -1848,6 +1885,11 @@ if __name__ == "__main__":
     )
 
     #################### Eval #####################
+    parser.add_argument(
+        "--enable_eval",
+        action="store_true",
+        help="Enable evaluation during training",
+    )
     parser.add_argument(
         "--eval_steps",
         type=int,

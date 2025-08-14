@@ -19,6 +19,9 @@ function find_free_port() {
 
 free_port=$(find_free_port)
 
+# Disable wandb for now
+export WANDB_DISABLED=true
+
 # wandb key
 wandb_key="66795f41320baafdbf8b4a19b62dce232ded0c2e"
 
@@ -41,14 +44,17 @@ unified_reward_default_question_type="semantic"
 unified_reward_num_workers=1
 
 # Dataset
-# data_json_path="data/rl_embeddings/prompt.json"
-data_json_path="data/rl_embeddings_ocr/prompt.json" # For ocr task
-test_data_json_path="data/rl_embeddings_ocr_test/prompt.json"
+data_json_path="data/rl_embeddings/prompt.json"
+test_data_json_path="data/rl_embeddings_test/prompt.json"
+
+# data_json_path="data/rl_embeddings_ocr/prompt.json" # For ocr task
+# test_data_json_path="data/rl_embeddings_ocr_test/prompt.json"
 
 
 # MixGRPO Hyperparameters
-experiment_prefix="exp_1"
-reward_model="ocr_score"
+experiment_prefix="exp_2"
+# reward_model="ocr_score"
+reward_model="clip_score"
 experiment_name="${experiment_prefix}_${reward_model}"
 # "hpsv2", "clip_score" "image_reward", "ocr_score", "pick_score", "unified_reward", "hpsv2_clip_score", "multi_reward"
 seed=714
@@ -125,6 +131,7 @@ echo "free_port=$free_port"
 # Run single node training with torchrun
 torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_port \
     fastvideo/train_grpo_flux.py \
+    --enable_eval \
     --seed $seed \
     --pretrained_model_name_or_path $model_path \
     --vae_model_path $model_path \
@@ -132,10 +139,13 @@ torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_p
     --data_json_path $data_json_path \
     --test_data_json_path $test_data_json_path \
     --gradient_checkpointing \
-    --train_batch_size 1 \
+    --train_batch_size 2 \
+    --sample_batch_size 2 \
+    --test_batch_size 2 \
     --num_latent_t 1 \
     --sp_size 1 \
     --train_sp_batch_size 1 \
+    --test_sp_batch_size 1 \
     --dataloader_num_workers 4 \
     --gradient_accumulation_steps $gradient_accumulation_steps \
     --max_train_steps 300 \

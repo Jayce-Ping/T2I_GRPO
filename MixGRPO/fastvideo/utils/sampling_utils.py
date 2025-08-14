@@ -64,6 +64,7 @@ def run_sample_step(
         timestep_value = int(sigma * 1000)
         timesteps = torch.full([encoder_hidden_states.shape[0]], timestep_value, device=z.device, dtype=torch.long)
         transformer.eval()
+
         with torch.autocast("cuda", torch.bfloat16):
             pred=transformer(
                 hidden_states=z,
@@ -74,9 +75,9 @@ def run_sample_step(
                     device=z.device,
                     dtype=torch.bfloat16
                 ),
-                txt_ids=text_ids.repeat(encoder_hidden_states.shape[1],1), # B, L
+                txt_ids=text_ids.repeat(encoder_hidden_states.shape[1], 1), # No batch size dimension is required, so 2D-tensor, but its first dimension should be the same as the second dimension of encoder_hidden_states
                 pooled_projections=pooled_prompt_embeds,
-                img_ids=image_ids,
+                img_ids=image_ids,# No batch size dimension is required, so 2D-tensor
                 joint_attention_kwargs=None,
                 return_dict=False,
             )[0]
@@ -150,7 +151,7 @@ def run_sample_step(
     if args.drop_last_sample:
         latents = pred_original
     else:
-        latents = z.to(pred_original.dtype)
+        latents = z.to(pred_original.dtype) # (4, 64, 64)
     all_latents = torch.stack(all_latents, dim=1)  # (batch_size, num_steps + 1, 4, 64, 64)
     all_log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps, 1)
     return z, latents, all_latents, all_log_probs

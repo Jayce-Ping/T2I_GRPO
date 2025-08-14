@@ -315,13 +315,13 @@ def sp_parallel_dataloader_wrapper(
     while True:
         for data_item in dataloader:
             encoder_hidden_states, pooled_prompt_embeds, text_ids, caption = data_item
-            #latents = latents.to(device)
+            # latents = latents.to(device)
             encoder_hidden_states = encoder_hidden_states.to(device)
             pooled_prompt_embeds = pooled_prompt_embeds.to(device)
             text_ids = text_ids.to(device)
-            #frame = latents.shape[2]
-            frame = 19
-            if frame == 1:
+            # frame_num = latents.shape[2]
+            frame_num = 19
+            if frame_num == 1:
                 yield encoder_hidden_states, pooled_prompt_embeds, text_ids, caption
             else:
                 encoder_hidden_states, pooled_prompt_embeds, text_ids, caption = prepare_sequence_parallel_data(
