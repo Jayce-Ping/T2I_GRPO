@@ -546,9 +546,6 @@ def evaluate(
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE    # This list will only be populated on rank 0
     all_eval_results_for_logging = []
 
-    # Set small max_eval_num for efficiency
-    args.max_eval_num = 1
-
     with torch.no_grad():
         all_eval_results_for_logging = []
         image_ids = prepare_latent_image_ids(latent_h // 2, latent_w // 2, device, torch.bfloat16)
@@ -567,7 +564,7 @@ def evaluate(
 
 
             # Enough reaults
-            if len(all_eval_results_for_logging) >= max_eval_num:
+            if len(all_eval_results_for_logging) >= args.max_eval_num:
                 break
 
             B = encoder_hidden_states_batch.shape[0]
