@@ -77,10 +77,12 @@ gradient_accumulation_steps=4
 h=1024
 w=1024
 t=1
-train_batch_size=1
-test_batch_size=1
-num_eval_samples=6
-num_generations=12
+# Big Memory Influencers
+train_batch_size=4
+test_batch_size=16
+num_generations=8
+max_eval_num=8
+num_eval_samples=8
 
 # DanceGRPO Sampling Parameters
 timestep_fraction=0.6
@@ -145,6 +147,7 @@ torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_p
     --train_batch_size $train_batch_size \
     --num_generations $num_generations \
     --test_batch_size $test_batch_size \
+    --max_eval_num $max_eval_num \
     --num_latent_t 1 \
     --sp_size 1 \
     --train_sp_batch_size 1 \

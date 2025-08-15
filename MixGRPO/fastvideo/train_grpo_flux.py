@@ -267,20 +267,21 @@ def sample_reference_model(
         determistic = [False] * sample_steps
 
     progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress", disable=not dist.is_initialized() or dist.get_rank() != 0)
-
-    z, latents, all_latents, all_log_probs = sample_diffusion_trajectory(
-            args,
-            input_latents,
-            progress_bar,
-            sigma_schedule,
-            transformer,
-            encoder_hidden_states,
-            pooled_prompt_embeds,
-            text_ids, # 2D tensor
-            image_ids, # 2D tensor
-            grpo_sample,
-            determistic=determistic,
-        )
+    
+    with torch.no_grad():
+        z, latents, all_latents, all_log_probs = sample_diffusion_trajectory(
+                args,
+                input_latents,
+                progress_bar,
+                sigma_schedule,
+                transformer,
+                encoder_hidden_states,
+                pooled_prompt_embeds,
+                text_ids, # 2D tensor
+                image_ids, # 2D tensor
+                grpo_sample,
+                determistic=determistic,
+            )
 
     vae.enable_tiling()
     
@@ -328,8 +329,7 @@ def train_one_step(
     timesteps_train : List[int],
     global_step : int
 ) -> Dict[str, Union[float, torch.Tensor]]:
-
-
+    
     optimizer.zero_grad()
 
     (
@@ -340,7 +340,6 @@ def train_one_step(
     ) = train_batch
 
     B = encoder_hidden_states.shape[0] # = args.train_batch_size
-    print("Input encoder hidden stats shape", encoder_hidden_states.shape)
     w, h = args.w, args.h
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
     # Latest flux only requires 2-D dimensional tensor of image_ids, no batch dimention.
@@ -352,6 +351,7 @@ def train_one_step(
     # So reshape it to (1, 3) for canonicalization.
     text_ids = text_ids[0].unsqueeze(0)
 
+    # Break in sampling
     rewards, all_latents, all_log_probs, sigma_schedule = sample_reference_model(
             args,
             device,
@@ -381,15 +381,18 @@ def train_one_step(
         "rewards": rewards
     }
 
-    gathered_reward = gather_tensor(rewards)
+    # Gather rewards from all processes
+    gathered_reward = gather_tensor(samples['rewards'])
 
     if dist.get_rank()==0:
         print(f"gathered_{args.reward_model}:", gathered_reward)
 
+    # print("Gathered_rewards", gathered_reward)
     # Compute advantages
-    print("Start to compute advantages")
-    advantages = (samples["rewards"] - gathered_reward.mean())/(gathered_reward.std()+1e-8)
+    # print("Start to compute advantages")
+    advantages = (samples["rewards"] - gathered_reward.mean())/(gathered_reward.std() + EPSILON)
     samples["advantages"] = advantages
+    # print("Advanages shape", advantages.shape)
     # if args.use_group:
     #     # Compute advantages for each prompt
     #     n = len(samples["rewards"]) // (args.num_generations)
@@ -440,8 +443,9 @@ def train_one_step(
 
 
     total_loss = 0.0
+    total_policy_loss = 0.0
+    total_kl_loss = 0.0
 
-    print("Start to compute log probabilities and advantages")
     for i, sample in enumerate(samples_batched_list):
         for t in timesteps_train:
             if dist.get_rank() == 0:
@@ -488,7 +492,12 @@ def train_one_step(
             loss.backward()
 
             with torch.no_grad():
-                total_loss += loss.item()
+                # Use one single tensor to stack all loss tensors
+                loss_info = torch.stack([l.detach().clone() for l in [loss, policy_loss, kl_loss]])
+                # Use one single tensor for efficient communication
+                dist.all_reduce(loss_info, op=dist.ReduceOp.AVG)
+                for l, total in zip(loss_info, [total_loss, total_policy_loss, total_kl_loss]):
+                    total += l.item()
                 
 
         if (i + 1) % args.gradient_accumulation_steps == 0:
@@ -505,7 +514,8 @@ def train_one_step(
 
     return {
         'loss': total_loss,
-        'grad_norm': grad_norm.item(),
+        'policy_loss': total_policy_loss,
+        'kl_loss': total_kl_loss,
         'reward': gathered_reward
     }
 
@@ -536,8 +546,8 @@ def evaluate(
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE    # This list will only be populated on rank 0
     all_eval_results_for_logging = []
 
-    # Set a max_eval_num for efficiency
-    max_eval_num = 1
+    # Set small max_eval_num for efficiency
+    args.max_eval_num = 1
 
     with torch.no_grad():
         all_eval_results_for_logging = []
@@ -684,6 +694,10 @@ def evaluate(
         dist.barrier()
 
 
+def print_peak_mem_usage():
+    peak_mem = torch.cuda.max_memory_allocated()
+    print(f"Peak memory usage: {peak_mem / 1024**3:.2f} GB")
+
 def main(args):
     ############################# Init #############################
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -818,6 +832,7 @@ def main(args):
     params_to_optimize = list(filter(lambda p: p.requires_grad, params_to_optimize))
 
     if args.use_lora:
+        # Still not working, TODO
         from peft import LoraConfig, get_peft_model
         
         lora_config = LoraConfig(
@@ -970,6 +985,7 @@ def main(args):
             global_step += 1
             # Do evaluation every args.eval_steps
             if args.enable_eval and global_step % args.eval_steps == 0:
+                print_peak_mem_usage()
                 evaluate(
                     args,
                     device,
@@ -1042,16 +1058,14 @@ def main(args):
             if rank == 0:
                 
                 log_dict = {
-                    "train_loss": train_res['loss'],
                     "cur_timesteps": grpo_states.cur_timestep if args.training_strategy == "part" else 0,
                     "cur_iter_in_group": grpo_states.cur_iter_in_group if args.training_strategy == "part" else 0,
                     "learning_rate": lr_scheduler.get_last_lr()[0],
                     "step_time": step_time,
                     "avg_step_time": avg_step_time,
-                    "grad_norm": train_res['grad_norm'],
-                    "epoch": epoch,
-                    "reward_avg": train_res['reward']
+                    "epoch": epoch
                 }
+                log_dict.update(train_res)
                 wandb.log(log_dict, step=global_step)
         
             if dist.is_initialized():
@@ -1656,6 +1670,12 @@ if __name__ == "__main__":
         type=int,
         default=10,
         help="Number of steps between evaluations",
+    )
+    parser.add_argument(
+        '--max_eval_num',
+        type=int,
+        default=12,
+        help="Maximum number of evaluations to perform",
     )
     parser.add_argument(
         "--num_eval_samples",
