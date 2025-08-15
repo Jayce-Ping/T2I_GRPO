@@ -84,8 +84,8 @@ t=1
 train_batch_size=2
 test_batch_size=16
 num_generations=8
-max_eval_num=8
-num_eval_samples=8
+max_eval_num=16
+num_eval_samples=4
 
 # DanceGRPO Sampling Parameters
 timestep_fraction=0.6

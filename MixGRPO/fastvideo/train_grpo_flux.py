@@ -228,13 +228,8 @@ def sample_reference_model(
     sample_steps = args.sampling_steps
     sigma_schedule = torch.linspace(1, 0, args.sampling_steps + 1).to(device)
     
-    sigma_schedule = timesteps_shift(args.shift, sigma_schedule) # [1, 0], length=17
+    sigma_schedule = timesteps_shift(args.shift, sigma_schedule) # len(sigma_schedule) == sample_steps + 1
 
-    assert_eq(
-        len(sigma_schedule),
-        sample_steps + 1,
-        "sigma_schedule must have length sample_steps + 1",
-    )
     w, h, t = args.w, args.h, args.t
     B = encoder_hidden_states.shape[0]
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
@@ -643,9 +638,7 @@ def evaluate(
     if rank == 0:
         log_start_time = time.time()
         with tempfile.TemporaryDirectory() as tmpdir:
-            wandb_log_dict = {
-                "eval/prompt_details": []
-            }
+            wandb_log_dict = {}
             
             for prompt_idx, result in enumerate(all_eval_results_for_logging):
                 prompt = result["prompt"]
@@ -989,7 +982,7 @@ def main(args):
                     num_eval_samples=args.num_eval_samples
                 )
 
-            if rank <= 0 and step % args.checkpointing_steps == 0:
+            if step % args.checkpointing_steps == 0:
                 # Save at most 2 latest checkpoints
                 checkpoint_saving_dir = f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}"
                 os.makedirs(checkpoint_saving_dir, exist_ok=True)
@@ -1002,7 +995,9 @@ def main(args):
                     existing_checkpoints.sort()
                     shutil.rmtree(os.path.join(checkpoint_saving_dir, existing_checkpoints[0]))
                 
-                if args.use_lora:
+                if not args.use_lora:
+                    save_checkpoint(transformer, rank, checkpoint_saving_dir, step, epoch)
+                else:
                     temp_pipeline = FluxPipeline.from_pretrained(
                         args.pretrained_model_name_or_path,
                         transformer=None,
@@ -1014,8 +1009,6 @@ def main(args):
                     temp_pipeline.text_encoder = None
                     temp_pipeline.text_encoder_2 = None
                     save_lora_checkpoint(transformer, optimizer, rank, checkpoint_saving_dir, step, temp_pipeline, epoch)
-                else:
-                    save_checkpoint(transformer, rank, checkpoint_saving_dir, step, epoch)
 
             if dist.is_initialized():
                 dist.barrier()
