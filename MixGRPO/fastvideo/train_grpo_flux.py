@@ -506,9 +506,6 @@ def train_one_step(
     return {
         'loss': total_loss,
         'grad_norm': grad_norm.item(),
-        'policy_loss': policy_total_loss,
-        'kl_loss': kl_total_loss,
-        'clip_frac': total_clip_frac,
         'reward': gathered_reward
     }
 
@@ -805,6 +802,7 @@ def main(args):
         apply_fsdp_checkpointing(
             transformer, no_split_modules, args.selective_checkpointing
         )
+        # transformer.gradient_checkpointing_enable() # New added, need test
 
 
     main_print(
@@ -1045,9 +1043,6 @@ def main(args):
                 
                 log_dict = {
                     "train_loss": train_res['loss'],
-                    "policy_loss": train_res['policy_loss'],
-                    "kl_loss": train_res['kl_loss'],
-                    "clip_frac": train_res['clip_frac'],
                     "cur_timesteps": grpo_states.cur_timestep if args.training_strategy == "part" else 0,
                     "cur_iter_in_group": grpo_states.cur_iter_in_group if args.training_strategy == "part" else 0,
                     "learning_rate": lr_scheduler.get_last_lr()[0],
