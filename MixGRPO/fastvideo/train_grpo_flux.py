@@ -989,7 +989,7 @@ def main(args):
                     num_eval_samples=args.num_eval_samples
                 )
 
-            if step % args.checkpointing_steps == 0:
+            if rank <= 0 and step % args.checkpointing_steps == 0:
                 # Save at most 2 latest checkpoints
                 checkpoint_saving_dir = f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}"
                 os.makedirs(checkpoint_saving_dir, exist_ok=True)
@@ -1017,8 +1017,8 @@ def main(args):
                 else:
                     save_checkpoint(transformer, rank, checkpoint_saving_dir, step, epoch)
 
-                if dist.is_initialized():
-                    dist.barrier()
+            if dist.is_initialized():
+                dist.barrier()
 
             start_time = time.time()
             if args.training_strategy == "part":

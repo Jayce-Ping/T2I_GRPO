@@ -77,8 +77,11 @@ gradient_accumulation_steps=4
 h=1024
 w=1024
 t=1
+# Ceilling config:
+#   OCR: train_batch_size=4, num_generation=8
+
 # Big Memory Influencers
-train_batch_size=4
+train_batch_size=2
 test_batch_size=16
 num_generations=8
 max_eval_num=8
