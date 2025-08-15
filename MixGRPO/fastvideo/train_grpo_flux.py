@@ -10,70 +10,79 @@
 # This modified file is released under the same license.
 
 import argparse
+import concurrent.futures
+import json
 import math
 import os
-from pathlib import Path
 import shutil
 import tempfile
-from typing import Optional, Union, Dict, Any, List
-
-import wandb.util
-from fastvideo.utils.parallel_states import (
-    initialize_sequence_parallel_state,
-    destroy_sequence_parallel_group,
-    get_sequence_parallel_state,
-    nccl_info,
-)
-from fastvideo.utils.communications_flux import sp_parallel_dataloader_wrapper
-# from fastvideo.utils.validation import log_validation
 import time
-from torch.utils.data import DataLoader, Dataset
-import torch
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from collections import deque
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union, Tuple
+from argparse import Namespace
 
-from torch.utils.data.distributed import DistributedSampler
-from fastvideo.utils.dataset_utils import LengthGroupedSampler
+import cv2
+import numpy as np
+import torch
+import torch.distributed as dist
 import wandb
+import wandb.util
 from accelerate.utils import set_seed
-from tqdm.auto import tqdm
-from fastvideo.utils.fsdp_util import get_dit_fsdp_kwargs, apply_fsdp_checkpointing
-from fastvideo.utils.load import load_transformer
+from diffusers import AutoencoderKL, FluxTransformer2DModel, FluxPipeline
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
-from fastvideo.dataset.latent_flux_rl_datasets import LatentDataset, latent_collate_function
+from diffusers.utils.torch_utils import randn_tensor
+from einops import rearrange
+from PIL import Image
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from fastvideo.utils.checkpoint import (
-    save_checkpoint,
-    save_lora_checkpoint,
-)
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
+from tqdm.auto import tqdm
+
+from fastvideo.dataset.latent_flux_rl_datasets import LatentDataset, latent_collate_function
+from fastvideo.dataset.text_dataset import TextPromptDataset, JsonPromptDataset
+from fastvideo.reward.clip_score import CLIPScoreRewardModel
+from fastvideo.reward.hps_score import HPSClipRewardModel
+from fastvideo.reward.image_reward import ImageRewardModel
+from fastvideo.reward.ocr_score import OcrRewardModel
+from fastvideo.reward.pick_score import PickScoreRewardModel
+from fastvideo.reward.unified_reward import UnifiedRewardModel
+from fastvideo.reward.utils import balance_pos_neg, compute_reward
+from fastvideo.utils.checkpoint import save_checkpoint, save_lora_checkpoint
+from fastvideo.utils.communications_flux import sp_parallel_dataloader_wrapper
+from fastvideo.utils.dataset_utils import LengthGroupedSampler
+from fastvideo.utils.fsdp_util import apply_fsdp_checkpointing, get_dit_fsdp_kwargs
+from fastvideo.utils.grpo_states import GRPOTrainingStates
+from fastvideo.utils.load import load_transformer
 from fastvideo.utils.logging_ import main_print
-import cv2
-from diffusers.image_processor import VaeImageProcessor
+from fastvideo.utils.parallel_states import (
+    destroy_sequence_parallel_group,
+    get_sequence_parallel_state,
+    initialize_sequence_parallel_state,
+    nccl_info,
+)
+from fastvideo.utils.sampling_utils import (
+    dance_grpo_denoising_step,
+    dpm_denoising_step,
+    flow_grpo_denoising_step,
+    sample_diffusion_trajectory,
+    timesteps_shift,
+)
+# from fastvideo.utils.validation import log_validation
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.31.0")
-import time
-from collections import deque
-import numpy as np
-from einops import rearrange
-import torch.distributed as dist
-from torch.nn import functional as F
-from typing import List
-from PIL import Image
-from diffusers import FluxTransformer2DModel, AutoencoderKL
-from fastvideo.utils.grpo_states import GRPOTrainingStates
-import json
-from fastvideo.models.reward_model.image_reward import ImageRewardModel
-from fastvideo.models.reward_model.pick_score import PickScoreRewardModel
-from fastvideo.models.reward_model.unified_reward import UnifiedRewardModel
-from fastvideo.models.reward_model.hps_score import HPSClipRewardModel
-from fastvideo.models.reward_model.clip_score import CLIPScoreRewardModel
-from fastvideo.models.reward_model.ocr_score import OcrRewardModel
-from fastvideo.models.reward_model.utils import compute_reward, balance_pos_neg
-from diffusers.utils.torch_utils import randn_tensor
-from typing import Optional
-import concurrent.futures
-from fastvideo.utils.sampling_utils import flow_grpo_step, dance_grpo_step, run_sample_step, sd3_time_shift, dpm_step
+
+
+# Some constants
+
+EPSILON = 1e-8
+SPATIAL_DOWNSAMPLE = 8
+IN_CHANNELS = 16
+    
 
 def assert_eq(x, y, msg=None):
     assert x == y, f"{msg or 'Assertion failed'}: {x} != {y}"
@@ -82,6 +91,9 @@ def assert_eq(x, y, msg=None):
 class DistributedKRepeatSampler(DistributedSampler):
     def __init__(self, dataset : Dataset, num_replicas=None, rank=None, shuffle=True, seed=0, k=1):
         super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle, seed=seed)
+        """
+        DistributedKRepeatSampler is a distributed sampler that repeats each index k times.
+        """
         
         # Number of times to repeat each index
         self.k = k
@@ -101,7 +113,16 @@ class DistributedKRepeatSampler(DistributedSampler):
         return super().__len__() * self.k
 
 
-def prepare_latent_image_ids(batch_size, height, width, device, dtype):
+def compute_text_embeddings(pipeline : FluxPipeline, prompt : str, device : torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        prompt_embeds, pooled_prompt_embeds, text_ids = pipeline.encode_prompt(prompt)
+        prompt_embeds = prompt_embeds.to(device)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(device)
+        text_ids = text_ids.to(device)
+
+    return prompt_embeds, pooled_prompt_embeds, text_ids
+
+def prepare_latent_image_ids(height : int, width : int, device : torch.device, dtype : torch.dtype) -> torch.Tensor:
     latent_image_ids = torch.zeros(height, width, 3)
     latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
     latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, :]
@@ -114,14 +135,14 @@ def prepare_latent_image_ids(batch_size, height, width, device, dtype):
 
     return latent_image_ids.to(device=device, dtype=dtype)
 
-def pack_latents(latents, batch_size, num_channels_latents, height, width):
+def pack_latents(latents : torch.Tensor, batch_size : int, num_channels_latents : int, height : int, width : int) -> torch.Tensor:
     latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
     latents = latents.permute(0, 2, 4, 1, 3, 5)
     latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
 
     return latents
 
-def unpack_latents(latents, height, width, vae_scale_factor):
+def unpack_latents(latents : torch.Tensor, height : int, width : int, vae_scale_factor : int) -> torch.Tensor:
     batch_size, num_patches, channels = latents.shape
 
     # VAE applies 8x compression on images but we must also account for packing which requires
@@ -136,26 +157,26 @@ def unpack_latents(latents, height, width, vae_scale_factor):
 
     return latents
 
-def grpo_one_step(
-    args,
-    latents,
-    pre_latents,
-    encoder_hidden_states, 
-    pooled_prompt_embeds, 
-    text_ids,
-    image_ids,
-    transformer,
-    timesteps,
-    i,
-    sigma_schedule,
-):
+def compute_log_probs(
+    args : Namespace,
+    latents : torch.Tensor,
+    pre_latents : torch.Tensor,
+    encoder_hidden_states : torch.Tensor,
+    pooled_prompt_embeds : torch.Tensor,
+    text_ids : torch.Tensor,
+    image_ids : torch.Tensor,
+    transformer : FluxTransformer2DModel,
+    timesteps : List[int],
+    i : int,
+    sigma_schedule : List[float],
+) -> torch.Tensor:
     B = encoder_hidden_states.shape[0]
     transformer.train()
     with torch.autocast("cuda", torch.bfloat16):
         pred= transformer(
             hidden_states=latents,
             encoder_hidden_states=encoder_hidden_states,
-            timestep=timesteps/1000,
+            timestep= timesteps / 1000,
             guidance=torch.tensor(
                 [3.5],
                 device=latents.device,
@@ -167,9 +188,11 @@ def grpo_one_step(
             joint_attention_kwargs=None,
             return_dict=False,
         )[0]
+
+    
     if args.dpm_algorithm_type == "null" or ("dpmsolver" in args.dpm_algorithm_type and args.dpm_apply_strategy == "post"):
         if args.flow_grpo_sampling:
-            z, pred_original, log_prob, prev_latents_mean, std_dev_t = flow_grpo_step(
+            z, pred_original, log_prob, prev_latents_mean, std_dev_t = flow_grpo_denoising_step(
                 model_output=pred,
                 latents=latents.to(torch.float32),
                 eta=args.eta,
@@ -179,9 +202,9 @@ def grpo_one_step(
                 determistic=False,
             )
         else:
-            z, pred_original, log_prob = dance_grpo_step(pred, latents.to(torch.float32), args.eta, sigma_schedule, i, prev_sample=pre_latents.to(torch.float32), grpo=True, sde_solver=True)
+            z, pred_original, log_prob = dance_grpo_denoising_step(pred, latents.to(torch.float32), args.eta, sigma_schedule, i, prev_sample=pre_latents.to(torch.float32), grpo=True, sde_solver=True)
     elif "dpmsolver" in args.dpm_algorithm_type:
-        z, pred_original, log_prob = dpm_step(
+        z, pred_original, log_prob = dpm_denoising_step(
             args,
             model_output=pred,
             sample=latents.to(torch.float32),
@@ -195,23 +218,23 @@ def grpo_one_step(
     return log_prob
 
 def sample_reference_model(
-    args,
-    device,
-    transformer,
-    vae,
-    encoder_hidden_states, 
-    pooled_prompt_embeds, 
-    text_ids,
-    reward_model,
-    captions,
-    timesteps_train, # index
-    global_step
+    args : Namespace,
+    device : torch.device,
+    transformer : FluxTransformer2DModel,
+    vae : AutoencoderKL,
+    encoder_hidden_states : torch.Tensor, 
+    pooled_prompt_embeds : torch.Tensor, 
+    text_ids : torch.Tensor,
+    reward_model : RewardModel,
+    captions : List[str],
+    timesteps_train : List[int],
+    global_step : int
 ):
     w, h, t = args.w, args.h, args.t
     sample_steps = args.sampling_steps
     sigma_schedule = torch.linspace(1, 0, args.sampling_steps + 1).to(device)
     
-    sigma_schedule = sd3_time_shift(args.shift, sigma_schedule) # [1, 0], length=17
+    sigma_schedule = timesteps_shift(args.shift, sigma_schedule) # [1, 0], length=17
 
     assert_eq(
         len(sigma_schedule),
@@ -219,16 +242,9 @@ def sample_reference_model(
         "sigma_schedule must have length sample_steps + 1",
     )
     w, h, t = args.w, args.h, args.t
-    B = encoder_hidden_states.shape[0] # = args.num_generations * args.train_batch_size
-    SPATIAL_DOWNSAMPLE = 8
-    IN_CHANNELS = 16
+    B = encoder_hidden_states.shape[0]
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
-
-    image_ids = prepare_latent_image_ids(B, latent_h // 2, latent_w // 2, device, torch.bfloat16)
-
-    sample_batch_size = args.sample_batch_size
-    assert sample_batch_size <= args.num_generations, "sample_batch_size must be less than num_generations"
-    assert args.num_generations % sample_batch_size == 0, "num_generations must be divisible by sample_batch_size"
+    image_ids = prepare_latent_image_ids(latent_h // 2, latent_w // 2, device, torch.bfloat16)
 
     if args.init_same_noise:
         input_latents = torch.randn(
@@ -258,7 +274,7 @@ def sample_reference_model(
 
     progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress", disable=not dist.is_initialized() or dist.get_rank() != 0)
 
-    z, latents, all_latents, all_log_probs = run_sample_step(
+    z, latents, all_latents, all_log_probs = sample_diffusion_trajectory(
             args,
             input_latents,
             progress_bar,
@@ -272,11 +288,9 @@ def sample_reference_model(
             determistic=determistic,
         )
 
-
     vae.enable_tiling()
     
     image_processor = VaeImageProcessor(do_resize=True)
-    rank = int(os.environ["RANK"])
     
     with torch.inference_mode():
         with torch.autocast("cuda", torch.bfloat16):
@@ -293,10 +307,10 @@ def sample_reference_model(
             reward_model
         )
 
-    return rewards, all_latents, all_log_probs, sigma_schedule, image_ids
+    return rewards, all_latents, all_log_probs, sigma_schedule
 
 
-def gather_tensor(tensor):
+def gather_tensor(tensor : torch.Tensor) -> torch.Tensor:
     if not dist.is_initialized():
         return tensor
     world_size = dist.get_world_size()
@@ -316,39 +330,37 @@ def gather_objects(local_results : Any, rank, world_size) -> List[Any]:
     return all_results
 
 def train_one_step(
-    args,
-    device,
-    transformer,
-    vae,
-    reward_model,
-    optimizer,
-    lr_scheduler,
-    loader,
-    noise_scheduler,
-    max_grad_norm,
-    timesteps_train, # index
-    global_step
-):
+    args : Namespace,
+    device : torch.device,
+    transformer : FluxTransformer2DModel,
+    vae : AutoencoderKL,
+    reward_model : RewardModel,
+    optimizer : torch.optim.Optimizer,
+    lr_scheduler : torch.optim.lr_scheduler.LambdaLR,
+    train_batch : Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str]],
+    max_grad_norm : float,
+    timesteps_train : List[int],
+    global_step : int
+) -> Dict[str, Union[float, torch.Tensor]]:
     total_loss = 0.0
     kl_total_loss = 0.0
     policy_total_loss = 0.0
     total_clip_frac = 0.0
 
     optimizer.zero_grad()
+
     (
-        encoder_hidden_states, 
-        pooled_prompt_embeds, 
+        encoder_hidden_states,
+        pooled_prompt_embeds,
         text_ids,
         caption,
-    ) = next(loader)
+    ) = train_batch
 
     B = encoder_hidden_states.shape[0] # = args.num_generations * args.train_batch_size
     w, h = args.w, args.h
-    SPATIAL_DOWNSAMPLE = 8
-    IN_CHANNELS = 16
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
     # Latest flux only requires 2-D dimensional tensor of image_ids, no batch dimention.
-    image_ids = prepare_latent_image_ids(B, latent_h // 2, latent_w // 2, device, torch.bfloat16)
+    image_ids = prepare_latent_image_ids(latent_h // 2, latent_w // 2, device, torch.bfloat16)
 
     # Note: No batch dimension required for both text_ids and img_ids, and all text_ids are the same.
     # refer to https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_flux.py#L631
@@ -356,7 +368,7 @@ def train_one_step(
     # So reshape it to (1, 3) for canonicalization.
     text_ids = text_ids[0].unsqueeze(0)
 
-    rewards, all_latents, all_log_probs, sigma_schedule, _ = sample_reference_model(
+    rewards, all_latents, all_log_probs, sigma_schedule = sample_reference_model(
             args,
             device,
             transformer,
@@ -369,117 +381,58 @@ def train_one_step(
             timesteps_train,
             global_step
         )
-    batch_size = all_latents.shape[0]
+
     timestep_value = [int(sigma * 1000) for sigma in sigma_schedule][:args.sampling_steps]
-    timestep_values = [timestep_value[:] for _ in range(batch_size)]
+    timestep_values = [timestep_value[:] for _ in range(B)]
     device = all_latents.device
     timesteps =  torch.tensor(timestep_values, device=all_latents.device, dtype=torch.long)
 
     samples = {
         "timesteps": timesteps.detach().clone()[:, :-1],
-        "latents": all_latents[
-            :, :-1
-        ][:, :-1],  # each entry is the latent before timestep t
-        "next_latents": all_latents[
-            :, 1:
-        ][:, :-1],  # each entry is the latent after timestep t
+        "latents": all_latents[:, :-2],  # each entry is the latent before timestep t
+        "next_latents": all_latents[:, 1:-1],  # each entry is the latent after timestep t
         "log_probs": all_log_probs[:, :-1],
         "encoder_hidden_states": encoder_hidden_states,
         "pooled_prompt_embeds": pooled_prompt_embeds,
+        "rewards": rewards
     }
 
-    # TODO: Figure out reward dimensions here.
-
-    print(rewards)
-
-    samples["rewards"] = {}
     gathered_reward = gather_tensor(rewards)
 
     if dist.get_rank()==0:
         print(f"gathered_{args.reward_model}:", gathered_reward)
 
-    #计算advantage
+    # Compute advantages
     if args.use_group:
-        if args.multi_reward_mix == "advantage_aggr":
-            model_advantages = {}
-            for model_name, model_rewards in samples["rewards"].items():
-                n = len(model_rewards) // B
-                advantages = torch.zeros_like(model_rewards)
-
-                for i in range(n):
-                    start_idx = i * B
-                    end_idx = (i + 1) * B
-                    group_rewards = model_rewards[start_idx:end_idx]
-                    if args.trimmed_ratio > 0:
-                        sorted_rewards = torch.sort(group_rewards)[0]
-                        len_sorted_rewards = len(sorted_rewards)
-                        trim_size = min(int(len_sorted_rewards * args.trimmed_ratio), len_sorted_rewards - 1)
-                        trimmed_rewards = sorted_rewards[trim_size:]
-                        group_mean = trimmed_rewards.mean()
-                        group_std = trimmed_rewards.std() + 1e-8
-                    else:
-                        group_mean = group_rewards.mean()
-                        group_std = group_rewards.std() + 1e-8
-                    advantages[start_idx:end_idx] += (group_rewards - group_mean) / group_std
-                
-                model_advantages[model_name] = advantages
-            # add all advantages
-            merged_advantages = torch.zeros_like(samples["rewards"][list(samples["rewards"].keys())[0]])
-            for model_name, model_advs in model_advantages.items():
-                merged_advantages += model_advs * reward_weights[model_name]
-            samples["advantages"] = merged_advantages
+        # Compute advantages for each prompt
+        n = len(samples["rewards"]) // (args.num_generations)
+        advantages = torch.zeros_like(samples["rewards"])
         
-        elif args.multi_reward_mix == "reward_aggr":
-            n = len(samples["rewards"]) // B
-            advantages = torch.zeros_like(samples["rewards"])
-            
-            for i in range(n):
-                start_idx = i * B
-                end_idx = (i + 1) * B
-                group_rewards = samples["rewards"][start_idx:end_idx]
-                if args.trimmed_ratio > 0:
-                    sorted_rewards = torch.sort(group_rewards)[0]
-                    len_sorted_rewards = len(sorted_rewards)
-                    trim_size = min(int(len_sorted_rewards * args.trimmed_ratio), len_sorted_rewards - 1)
-                    trimmed_rewards = sorted_rewards[trim_size:]
-                    group_mean = trimmed_rewards.mean()
-                    group_std = trimmed_rewards.std() + 1e-8
-                else:
-                    group_mean = group_rewards.mean()
-                    group_std = group_rewards.std() + 1e-8
-
-                advantages[start_idx:end_idx] = (group_rewards - group_mean) / group_std
-            
-            samples["advantages"] = advantages
-        else:
-            raise ValueError(
-                f"multi_reward_mix {args.multi_reward_mix} is not supported."
-            )
+        for i in range(n):
+            start_idx = i * args.num_generations
+            end_idx = (i + 1) * args.num_generations
+            group_rewards = samples["rewards"][start_idx:end_idx]
+            group_mean = group_rewards.mean()
+            group_std = group_rewards.std() + 1e-8
+            advantages[start_idx:end_idx] = (group_rewards - group_mean) / group_std
+        
+        samples["advantages"] = advantages
     else:
-        if args.multi_reward_mix == "advantage_aggr":
-            raise ValueError(
-                "multi_reward_mix 'advantage_aggr' is not supported when use_group is False."
-            )
-        elif args.multi_reward_mix == "reward_aggr":
-            advantages = (samples["rewards"] - gathered_reward.mean())/(gathered_reward.std()+1e-8)
-            samples["advantages"] = advantages
-        else:
-            raise ValueError(
-                f"multi_reward_mix {args.multi_reward_mix} is not supported."
-            )
+        # Compute advantages globally
+        advantages = (samples["rewards"] - gathered_reward.mean())/(gathered_reward.std()+1e-8)
+        samples["advantages"] = advantages
 
-    if args.training_strategy == "all":
-        perms = torch.stack(
-            [
-                torch.randperm(len(samples["timesteps"][0]))
-                for _ in range(batch_size)
-            ]
-        ).to(device) 
-        for key in ["timesteps", "latents", "next_latents", "log_probs"]:
-            samples[key] = samples[key][
-                torch.arange(batch_size).to(device) [:, None],
-                perms,
-            ]
+    time_perms = torch.stack(
+        [
+            torch.randperm(len(samples["timesteps"][0]))
+            for _ in range(B)
+        ]
+    ).to(device)
+    for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+        samples[key] = samples[key][
+            torch.arange(B).to(device)[:, None],
+            time_perms,
+        ]
 
     samples_batched = {
         k: v.unsqueeze(1)
@@ -493,38 +446,17 @@ def train_one_step(
     samples_batched_list = [
         dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
     ]
-
-    if args.training_strategy == "part":
-        train_timesteps = timesteps_train
-    elif args.training_strategy == "all":
-        if args.frozen_init_timesteps > 0:
-            assert args.frozen_init_timesteps <= len(samples["timesteps"][0])
-            train_timesteps = range(args.frozen_init_timesteps)
-        else:
-            train_timesteps = int(len(samples["timesteps"][0])*args.timestep_fraction)
-            train_timesteps = range(train_timesteps)
     
-    if args.training_strategy == "part":
-        if args.advantage_rerange_strategy == "null":
-            pass
-        elif args.advantage_rerange_strategy == "random":
-            samples_batched_list = balance_pos_neg(samples_batched_list, use_random=True)
-        elif args.advantage_rerange_strategy == "balance":
-            samples_batched_list = balance_pos_neg(samples_batched_list, use_random=False)
-        else:
-            raise ValueError(
-                f"advantage_rerange_strategy {args.advantage_rerange_strategy} is not supported."
-            )
     if dist.get_rank() == 0:
         optimize_sampling_time = 0
 
     for i, sample in enumerate(samples_batched_list):
-        for t in train_timesteps:
+        for t in timesteps_train:
             if dist.get_rank() == 0:
                 meta_optimize_sampling_time = time.time()
             clip_range = args.clip_range
             adv_clip_max = args.adv_clip_max
-            new_log_probs = grpo_one_step(
+            new_log_probs = compute_log_probs(
                 args,
                 sample["latents"][:,t],
                 sample["next_latents"][:,t],
@@ -534,7 +466,7 @@ def train_one_step(
                 image_ids,
                 transformer,
                 sample["timesteps"][:,t],
-                perms[i][t] if args.training_strategy == "all" else t,
+                time_perms[i][t],
                 sigma_schedule,
             )
 
@@ -557,26 +489,18 @@ def train_one_step(
                 1.0 + clip_range,
             )
             clip_frac = torch.mean((torch.abs(ratio - 1.0) > clip_range).float())
-            policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss)) / (args.gradient_accumulation_steps * len(train_timesteps))
-            kl_loss = 0.5 * torch.mean((new_log_probs - sample["log_probs"][:,t]) ** 2) / (args.gradient_accumulation_steps * len(train_timesteps))
+            policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss)) / (args.gradient_accumulation_steps * len(timesteps_train))
+            kl_loss = 0.5 * torch.mean((new_log_probs - sample["log_probs"][:, t]) ** 2) / (args.gradient_accumulation_steps * len(timesteps_train))
             loss = policy_loss + args.kl_coeff * kl_loss
 
             loss.backward()
-            avg_loss = loss.detach().clone()
-            dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
-            total_loss += avg_loss.item()
 
-            avg_policy_loss = policy_loss.detach().clone()
-            dist.all_reduce(avg_policy_loss, op=dist.ReduceOp.AVG)
-            policy_total_loss += avg_policy_loss.item()
-
-            avg_kl_loss = kl_loss.detach().clone()
-            dist.all_reduce(avg_kl_loss, op=dist.ReduceOp.AVG)
-            kl_total_loss += avg_kl_loss.item()
-
-            avg_clip_frac = clip_frac.detach().clone()
-            dist.all_reduce(avg_clip_frac, op=dist.ReduceOp.AVG)
-            total_clip_frac += avg_clip_frac.item()
+            # Use one single tensor to stack all loss tensors
+            loss_info = torch.stack([l.detach().clone() for l in [loss, policy_loss, kl_loss, clip_frac]])
+            # Use one single tensor for efficient communication
+            dist.all_reduce(loss_info, op=dist.ReduceOp.AVG)
+            for l, total in zip(loss_info, [total_loss, policy_total_loss, kl_total_loss, total_clip_frac]):
+                total += l.item()
 
         if (i + 1) % args.gradient_accumulation_steps == 0:
             grad_norm = transformer.clip_grad_norm_(max_grad_norm)
@@ -584,26 +508,20 @@ def train_one_step(
             lr_scheduler.step()
             optimizer.zero_grad()
         
-        # if dist.get_rank() % 8 == 0 and i == 0:
-        #     print("ratio", ratio)
-        #     print("advantage", sample["advantages"].item())
-        #     print("final loss", loss.item())
-        #     print("kl loss", kl_loss.item())
-
         if dist.get_rank() == 0:
             main_print(f"##### Optimize sampling time per step: {optimize_sampling_time / (i+1)} seconds")
 
         if dist.is_initialized():
             dist.barrier()
 
-    if args.multi_reward_mix == "advantage_aggr":
-        gathered_reward_res = {}
-        for model_name, model_rewards in gathered_reward.items():
-            gathered_reward_res[model_name] = model_rewards.mean().item()
-    elif args.multi_reward_mix == "reward_aggr":
-        gathered_reward_res = gathered_reward.mean().item()
-
-    return total_loss, grad_norm.item(), policy_total_loss, kl_total_loss, total_clip_frac, gathered_reward_res
+    return {
+        'loss': total_loss,
+        'grad_norm': grad_norm.item(),
+        'policy_loss': policy_total_loss,
+        'kl_loss': kl_total_loss,
+        'clip_frac': total_clip_frac,
+        'reward': gathered_reward
+    }
 
 
 def evaluate(
@@ -613,7 +531,7 @@ def evaluate(
     vae,
     reward_model,
     global_step,
-    test_dataset,
+    test_dataloader,
     num_eval_samples=6
 ):
     """
@@ -625,56 +543,20 @@ def evaluate(
     # Only print from the main process
     if rank == 0:
         print(f"Starting evaluation at step {global_step}")
-    
-
-    test_sampler = DistributedKRepeatSampler(
-        test_dataset,
-        rank=rank,
-        num_replicas=world_size,
-        shuffle=False,
-        seed=args.sampler_seed,
-        k=num_eval_samples
-    )
-
-    test_dataloader = DataLoader(
-        test_dataset,
-        sampler=test_sampler,
-        collate_fn=latent_collate_function,
-        pin_memory=True,
-        batch_size=args.test_batch_size,
-        num_workers=args.dataloader_num_workers,
-        drop_last=True,
-        shuffle=False
-    )
-
-
-    # The following function is used for Sequence Parallel, for video handling. No use here.
-    # test_dataloader_sp = sp_parallel_dataloader_wrapper(
-    #     test_dataloader,
-    #     device,
-    #     args.test_batch_size,
-    #     args.sp_size,
-    #     args.test_sp_batch_size,
-    # )
 
     w, h = args.w, args.h
     sample_steps = args.sampling_steps
     sigma_schedule = torch.linspace(1, 0, args.sampling_steps + 1).to(device)
-    sigma_schedule = sd3_time_shift(args.shift, sigma_schedule)
-    
-    SPATIAL_DOWNSAMPLE = 8
-    IN_CHANNELS = 16
-    latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
-    
-    
-    # This list will only be populated on rank 0
+    sigma_schedule = timesteps_shift(args.shift, sigma_schedule)
+
+    latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE    # This list will only be populated on rank 0
     all_eval_results_for_logging = []
 
     # Set a max_eval_num for efficiency
     max_eval_num = 1
 
     # Some shared variables for the evaluation
-    image_ids = prepare_latent_image_ids(1, latent_h // 2, latent_w // 2, device, torch.bfloat16)
+    image_ids = prepare_latent_image_ids(latent_h // 2, latent_w // 2, device, torch.bfloat16)
 
 
     all_eval_results_for_logging = []
@@ -721,8 +603,8 @@ def evaluate(
 
             progress_bar = tqdm(range(0, args.sampling_steps), desc="Batched Sampling for Eval", disable=(rank!=0))
             with torch.autocast("cuda", torch.bfloat16):
-                sigma_schedule = sd3_time_shift(args.shift, torch.linspace(1, 0, args.sampling_steps + 1).to(device))
-                z, latents, _, _ = run_sample_step(
+                sigma_schedule = timesteps_shift(args.shift, torch.linspace(1, 0, args.sampling_steps + 1).to(device))
+                z, latents, _, _ = sample_diffusion_trajectory(
                     args,
                     input_latents_packed,
                     progress_bar,
@@ -929,7 +811,13 @@ def main(args):
             subfolder="transformer",
             torch_dtype = torch.float32
     )
-    
+
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="vae",
+        torch_dtype = torch.bfloat16,
+    ).to(device)
+
     fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
         transformer,
         args.fsdp_sharding_startegy,
@@ -944,12 +832,7 @@ def main(args):
         apply_fsdp_checkpointing(
             transformer, no_split_modules, args.selective_checkpointing
         )
-    
-    vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="vae",
-        torch_dtype = torch.bfloat16,
-    ).to(device)
+
 
     main_print(
         f"--> Initializing FSDP with sharding strategy: {args.fsdp_sharding_startegy}"
@@ -960,11 +843,11 @@ def main(args):
     # Set model as trainable.
     transformer.train()
 
-    noise_scheduler = None
-
     params_to_optimize = transformer.parameters()
     params_to_optimize = list(filter(lambda p: p.requires_grad, params_to_optimize))
 
+
+    #-----------------------------Optimizer------------------------
     optimizer = torch.optim.AdamW(
         params_to_optimize,
         lr=args.learning_rate,
@@ -974,7 +857,6 @@ def main(args):
     )
 
     init_steps = 0
-    main_print(f"optimizer: {optimizer}")
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
@@ -986,21 +868,43 @@ def main(args):
         last_epoch=init_steps - 1,
     )
 
+
+    # ---------------------------Prepare data------------------------------
     train_dataset = LatentDataset(args.data_json_path, args.num_latent_t, args.cfg)
-    sampler = DistributedKRepeatSampler(
-            train_dataset,
-            rank=rank,
-            num_replicas=world_size,
-            shuffle=True,
-            seed=args.sampler_seed,
-            k=args.num_generations
+    test_dataset = LatentDataset(args.test_data_json_path, args.num_latent_t, args.cfg)
+
+
+    train_sampler = DistributedKRepeatSampler(
+        train_dataset,
+        rank=rank,
+        num_replicas=world_size,
+        shuffle=True,
+        seed=args.sampler_seed,
+        k=args.num_generations
     )
 
-    test_dataset = LatentDataset(args.test_data_json_path, args.num_latent_t, args.cfg)
+    test_sampler = DistributedKRepeatSampler(
+        test_dataset,
+        rank=rank,
+        num_replicas=world_size,
+        shuffle=False,
+        seed=args.sampler_seed,
+        k=6
+    )
 
     train_dataloader = DataLoader(
         train_dataset,
-        sampler=sampler,
+        sampler=train_sampler,
+        collate_fn=latent_collate_function,
+        pin_memory=True,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+        drop_last=True,
+    )
+    train_dataloader = iter(train_dataloader)
+    test_dataloader = DataLoader(
+        test_dataset,
+        sampler=test_sampler,
         collate_fn=latent_collate_function,
         pin_memory=True,
         batch_size=args.train_batch_size,
@@ -1008,8 +912,7 @@ def main(args):
         drop_last=True,
     )
 
-    #vae.enable_tiling()
-
+    # ---------------------Init wandb---------------------
     if rank <= 0:
         project = "MixGRPO-Flux"
         wandb_run = wandb.init(
@@ -1023,20 +926,14 @@ def main(args):
     if dist.is_initialized():
         dist.barrier()
 
-    # Train!
-    total_batch_size = (
-        args.train_batch_size
-        * world_size
-        * args.gradient_accumulation_steps
-        / args.sp_size
-        * args.train_sp_batch_size
-    )
+    # --------------------------Print Parameters--------------------------
+    total_batch_size = args.train_batch_size * world_size * args.gradient_accumulation_steps
     main_print("***** Running training *****")
     main_print(f"  Num examples = {len(train_dataset)}")
     main_print(f"  Resume training from step {init_steps}")
     main_print(f"  Instantaneous batch size per device = {args.train_batch_size}")
     main_print(
-        f"  Total train batch size = train_batch_size * world_size * gradient_acc_steps / sp_size * train_sp_batch_size = {args.train_batch_size} * {world_size} * {args.gradient_accumulation_steps} / {args.sp_size} * {args.train_sp_batch_size} = {total_batch_size}"
+        f"  Total train batch size = train_batch_size * world_size * gradient_acc_steps = {args.train_batch_size} * {world_size} * {args.gradient_accumulation_steps} = {total_batch_size}"
     )
     main_print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     main_print(f"  Total optimization steps per epoch = {args.max_train_steps}")
@@ -1049,7 +946,6 @@ def main(args):
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         assert NotImplementedError("resume_from_checkpoint is not supported now.")
-        # TODO
 
     progress_bar = tqdm(
         range(0, 100000),
@@ -1059,22 +955,13 @@ def main(args):
         disable=local_rank > 0,
     )
 
-    loader = iter(train_dataloader)
-    # The following code is from DanceGRPO, designed for Video input. Here we only have image-text.
-    # loader = sp_parallel_dataloader_wrapper(
-    #     train_dataloader,
-    #     device,
-    #     args.train_batch_size,
-    #     args.sp_size,
-    #     args.train_sp_batch_size,
-    # )
-
     step_times = deque(maxlen=100)
 
+    # -------------------------MixGRPO States-------------------------
     if args.training_strategy == "part":
         grpo_states = GRPOTrainingStates(
             iters_per_group=args.iters_per_group,
-            group_size=args.group_size,
+            window_size=args.window_size,
             max_timesteps=args.sampling_steps-2,  # Because the max timestep index is args.sampling_steps - 2
             cur_timestep=0,
             cur_iter_in_group=0,
@@ -1086,10 +973,11 @@ def main(args):
             roll_back=args.roll_back,
         )
 
+    # -------------------Begin training loop-------------------
     global_step = -1
     for epoch in range(1000000):
-        if isinstance(sampler, DistributedSampler):
-            sampler.set_epoch(epoch) # Crucial for distributed shuffling per epoch
+        if isinstance(train_sampler, DistributedSampler):
+            train_sampler.set_epoch(epoch) # Crucial for distributed shuffling per epoch
 
         for step in range(init_steps+1, args.max_train_steps+1):
             global_step += 1
@@ -1102,7 +990,7 @@ def main(args):
                     vae,
                     reward_model,
                     global_step,
-                    test_dataset,
+                    test_dataloader,
                     num_eval_samples=args.num_eval_samples
                 )
 
@@ -1131,7 +1019,7 @@ def main(args):
             elif args.training_strategy == "all":
                 timesteps_train = [ti for ti in range(args.sampling_steps)]
 
-            loss, grad_norm, policy_loss, kl_loss, clip_frac, reward = train_one_step(
+            train_res = train_one_step(
                 args,
                 device, 
                 transformer,
@@ -1139,8 +1027,7 @@ def main(args):
                 reward_model,
                 optimizer,
                 lr_scheduler,
-                loader,
-                noise_scheduler,
+                train_dataloader,
                 args.max_grad_norm,
                 timesteps_train,
                 global_step
@@ -1150,36 +1037,24 @@ def main(args):
             step_times.append(step_time)
             avg_step_time = sum(step_times) / len(step_times)
     
-            progress_bar.set_postfix(
-                {
-                    "loss": f"{loss:.4f}",
-                    "step_time": f"{step_time:.2f}s",
-                    "grad_norm": grad_norm,
-                }
-            )
+            progress_bar.set_postfix(train_res)
             progress_bar.update(1)
-            if rank <= 0:
+            if rank == 0:
+                
                 log_dict = {
-                    "train_loss": loss,
-                    "policy_loss": policy_loss,
-                    "kl_loss": kl_loss,
-                    "clip_frac": clip_frac,
+                    "train_loss": train_res['loss'],
+                    "policy_loss": train_res['policy_loss'],
+                    "kl_loss": train_res['kl_loss'],
+                    "clip_frac": train_res['clip_frac'],
                     "cur_timesteps": grpo_states.cur_timestep if args.training_strategy == "part" else 0,
                     "cur_iter_in_group": grpo_states.cur_iter_in_group if args.training_strategy == "part" else 0,
                     "learning_rate": lr_scheduler.get_last_lr()[0],
                     "step_time": step_time,
                     "avg_step_time": avg_step_time,
-                    "grad_norm": grad_norm,
+                    "grad_norm": train_res['grad_norm'],
                     "epoch": epoch,
+                    "reward_avg": train_res['reward']
                 }
-                if args.multi_reward_mix == "advantage_aggr":
-                    for model_name, model_rewards in reward.items():
-                        log_dict[f"reward_{model_name}"] = model_rewards
-                elif args.multi_reward_mix == "reward_aggr":
-                    log_dict["reward"] = reward
-
-                
-
                 wandb.log(log_dict, step=global_step)
         
             if dist.is_initialized():
@@ -1363,6 +1238,7 @@ if __name__ == "__main__":
             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
             ' "constant", "constant_with_warmup"]'
         ),
+        choices=['linear', 'cosine', 'cosine_with_restarts', 'polynomial', 'constant', 'constant_with_warmup']
     )
     parser.add_argument(
         "--lr_num_cycles",
@@ -1538,7 +1414,7 @@ if __name__ == "__main__":
         help="shift interval, moving the window after iters_per_group iterations",
     )
     parser.add_argument(
-        "--group_size",
+        "--window_size",
         type=int,
         default=4,
         help="sliding window size",

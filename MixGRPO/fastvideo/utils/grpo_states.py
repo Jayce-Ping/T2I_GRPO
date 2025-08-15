@@ -12,7 +12,7 @@ class GRPOTrainingStates:
     
     Attributes:
         iters_per_group (int): Number of iterations to train on each group of timesteps
-        group_size (int): Number of timesteps in each group
+        window_size (int): Number of timesteps in each group
         max_timesteps (int): Maximum number of timesteps to train on
         cur_timestep (int): Current timestep being trained on
         cur_iter_in_group (int): Current iteration within the current group
@@ -27,7 +27,7 @@ class GRPOTrainingStates:
         exp_decay_k (float): Decay rate for exponential decay strategy
     """
     iters_per_group: int
-    group_size: int
+    window_size: int
     max_timesteps: int
     cur_timestep: int = 0
     cur_iter_in_group: int = 0
@@ -91,7 +91,7 @@ class GRPOTrainingStates:
                 if self.prog_overlap:
                     self.cur_timestep += self.prog_overlap_step
                 else:
-                    self.cur_timestep += self.group_size
+                    self.cur_timestep += self.window_size
             if self.cur_timestep > self.max_timesteps:
                 if self.roll_back: # roll back to the start
                     self.roll_back_start()
@@ -99,7 +99,7 @@ class GRPOTrainingStates:
                     self.cur_timestep = self.max_timesteps
         elif self.sample_strategy == "random":
             rng = np.random.default_rng(seed)
-            self.cur_timestep = rng.integers(0, self.max_timesteps - self.group_size + 1)
+            self.cur_timestep = rng.integers(0, self.max_timesteps - self.window_size + 1)
         elif self.sample_strategy == "decay":
             self.cur_iter_in_group += 1
             current_iters = self.get_dynamic_iters_per_group()
@@ -108,7 +108,7 @@ class GRPOTrainingStates:
                 if self.prog_overlap:
                     self.cur_timestep += self.prog_overlap_step
                 else:
-                    self.cur_timestep += self.group_size
+                    self.cur_timestep += self.window_size
             if self.cur_timestep > self.max_timesteps:
                 if self.roll_back: # roll back to the start
                     self.roll_back_start()
@@ -122,7 +122,7 @@ class GRPOTrainingStates:
                 if self.prog_overlap:
                     self.cur_timestep += self.prog_overlap_step
                 else:
-                    self.cur_timestep += self.group_size
+                    self.cur_timestep += self.window_size
             if self.cur_timestep > self.max_timesteps:
                 if self.roll_back:
                     self.roll_back_start()
@@ -143,9 +143,9 @@ class GRPOTrainingStates:
         
         Returns:
             List[int]: List of timesteps to train on. 
-            For example, if cur_timestep=5 and group_size=2, returns [5, 6].
+            For example, if cur_timestep=5 and window_size=2, returns [5, 6].
         """
-        return list(range(self.cur_timestep, min(self.cur_timestep + self.group_size, self.max_timesteps)))
+        return list(range(self.cur_timestep, min(self.cur_timestep + self.window_size, self.max_timesteps)))
 
     def is_training_complete(self) -> bool:
         """Check if training is complete.
@@ -166,23 +166,23 @@ class GRPOTrainingStates:
 #     training is done in groups of timesteps.
     
 #     Attributes:
-#         group_size (int): Number of timesteps in each group
+#         window_size (int): Number of timesteps in each group
 #         max_timesteps (int): Maximum number of timesteps to train on
 #         cur_seed (int): Current seed for random sampling
 #     """
-#     def __init__(self, group_size: int, max_timesteps: int, init_seed: int):
-#         self.group_size = group_size
+#     def __init__(self, window_size: int, max_timesteps: int, init_seed: int):
+#         self.window_size = window_size
 #         self.max_timesteps = max_timesteps
 #         self.init_seed = init_seed
 #         random.seed(init_seed)
     
 #     def get_current_timesteps(self) -> List[int]:
-#         """Get the list of random timesteps to train, the length of list is group_size.
+#         """Get the list of random timesteps to train, the length of list is window_size.
         
 #         Returns:
 #             List[int]: List of timesteps to train on. 
 #         """
-#         timesteps = random.sample(range(self.max_timesteps), self.group_size)
+#         timesteps = random.sample(range(self.max_timesteps), self.window_size)
 #         return timesteps
 
 

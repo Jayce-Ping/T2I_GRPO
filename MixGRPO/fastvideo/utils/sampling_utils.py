@@ -1,27 +1,30 @@
 import math
 import torch
+from argparse import Namespace
+from typing import Tuple, List, Iterable
 from diffusers.utils.torch_utils import randn_tensor
 from typing import Optional, Union, List
 from dataclasses import dataclass
 from tqdm import tqdm
 import torch.distributed as dist
+from diffusers import FluxTransformer2DModel
 
-def sd3_time_shift(shift, t):
+def timesteps_shift(shift : torch.Tensor, t : torch.Tensor) -> torch.Tensor:
     return (shift * t) / (1 + (shift - 1) * t)
 
-def run_sample_step(
-    args,
-    z,
-    progress_bar,
-    sigma_schedule,
-    transformer,
-    encoder_hidden_states, 
-    pooled_prompt_embeds, 
-    text_ids,
-    image_ids, 
-    grpo_sample,
-    determistic,
-):
+def sample_diffusion_trajectory(
+    args : Namespace,
+    z : torch.Tensor,
+    progress_bar : tqdm,
+    sigma_schedule : torch.Tensor,
+    transformer : FluxTransformer2DModel,
+    encoder_hidden_states : torch.Tensor,
+    pooled_prompt_embeds : torch.Tensor,
+    text_ids : torch.Tensor,
+    image_ids : torch.Tensor,
+    grpo_sample : bool,
+    determistic : List[bool],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if grpo_sample:
         all_latents = [z]
         all_log_probs = []
@@ -46,7 +49,7 @@ def run_sample_step(
             # rebuild post sigma schedule
             post_time_step = torch.linspace(1, 0, sigma_schedule.size(0))[last_false_index+1].item()
             post_sigma_schedule = torch.linspace(post_time_step, 0, num_post_steps).to(z.device)
-            post_sigma_schedule = sd3_time_shift(args.shift, post_sigma_schedule)
+            post_sigma_schedule = timesteps_shift(args.shift, post_sigma_schedule)
 
             sigma_schedule = torch.cat(
                 [sigma_schedule[:last_false_index+1], post_sigma_schedule],
@@ -82,7 +85,7 @@ def run_sample_step(
             )[0]
         if args.dpm_algorithm_type == "null": # disable dpm_solver
             if args.flow_grpo_sampling:
-                z, pred_original, log_prob, prev_latents_mean, std_dev_t = flow_grpo_step(
+                z, pred_original, log_prob, prev_latents_mean, std_dev_t = flow_grpo_denoising_step(
                     model_output=pred,
                     latents=z.to(torch.float32),
                     eta=args.eta,
@@ -93,12 +96,12 @@ def run_sample_step(
                 )
             else:
                 if determistic[i]:
-                    z, pred_original, log_prob = dance_grpo_step(pred, z.to(torch.float32), args.eta, sigmas=sigma_schedule, index=i, prev_sample=None, grpo=True, sde_solver=False)
+                    z, pred_original, log_prob = dance_grpo_denoising_step(pred, z.to(torch.float32), args.eta, sigmas=sigma_schedule, index=i, prev_sample=None, grpo=True, sde_solver=False)
                 else:
-                    z, pred_original, log_prob = dance_grpo_step(pred, z.to(torch.float32), args.eta, sigmas=sigma_schedule, index=i, prev_sample=None, grpo=True, sde_solver=True)
+                    z, pred_original, log_prob = dance_grpo_denoising_step(pred, z.to(torch.float32), args.eta, sigmas=sigma_schedule, index=i, prev_sample=None, grpo=True, sde_solver=True)
         elif "dpmsolver" in args.dpm_algorithm_type:
             if args.dpm_apply_strategy == "all":
-                z, pred_original, log_prob = dpm_step(
+                z, pred_original, log_prob = dpm_denoising_step(
                     args,
                     model_output=pred,
                     sample=z.to(torch.float32),
@@ -115,7 +118,7 @@ def run_sample_step(
                     if args.flow_grpo_sampling:
                         x_0 = convert_model_output(pred, z.to(torch.float32), sigma_schedule, step_index=i)
                         dpm_state.update(x_0)
-                        z, pred_original, log_prob, prev_latents_mean, std_dev_t = flow_grpo_step(
+                        z, pred_original, log_prob, prev_latents_mean, std_dev_t = flow_grpo_denoising_step(
                             model_output=pred,
                             latents=z.to(torch.float32),
                             eta=args.eta,
@@ -127,13 +130,9 @@ def run_sample_step(
                         dpm_state.update_lower_order()
 
                     else:
-                        z, pred_original, log_prob = dance_grpo_step(pred, z.to(torch.float32), args.eta, sigmas=sigma_schedule, index=i, prev_sample=None, grpo=True, sde_solver=not determistic[i])
-                        # if determistic[i]:
-                        #     z, pred_original, log_prob = dance_grpo_step(pred, z.to(torch.float32), args.eta, sigmas=sigma_schedule, index=i, prev_sample=None, grpo=True, sde_solver=False)
-                        # else:
-                        #     z, pred_original, log_prob = dance_grpo_step(pred, z.to(torch.float32), args.eta, sigmas=sigma_schedule, index=i, prev_sample=None, grpo=True, sde_solver=True)
+                        z, pred_original, log_prob = dance_grpo_denoising_step(pred, z.to(torch.float32), args.eta, sigmas=sigma_schedule, index=i, prev_sample=None, grpo=True, sde_solver=not determistic[i])
                 else:
-                    z, pred_original, log_prob = dpm_step(
+                    z, pred_original, log_prob = dpm_denoising_step(
                         args,
                         model_output=pred,
                         sample=z.to(torch.float32),
@@ -150,12 +149,12 @@ def run_sample_step(
     if args.drop_last_sample:
         latents = pred_original
     else:
-        latents = z.to(pred_original.dtype) # (4, 64, 64)
+        latents = z.to(pred_original.dtype) # (batch_size, 4, 64, 64)
     all_latents = torch.stack(all_latents, dim=1)  # (batch_size, num_steps + 1, 4, 64, 64)
     all_log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps, 1)
     return z, latents, all_latents, all_log_probs
 
-def flow_grpo_step(
+def flow_grpo_denoising_step(
     model_output: torch.Tensor,
     latents: torch.Tensor,
     eta: float,
@@ -164,7 +163,7 @@ def flow_grpo_step(
     prev_sample: torch.Tensor,
     generator: Optional[torch.Generator] = None,
     determistic: bool = False,
-):
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     device = model_output.device
     # step_index = [self.index_for_timestep(t) for t in timestep]
     # prev_step_index = [step+1 for step in step_index]
@@ -184,7 +183,7 @@ def flow_grpo_step(
             " `prev_sample` stays `None`."
         )
     
-    prev_sample_mean = latents*(1+std_dev_t**2/(2*sigma)*dt)+model_output*(1+std_dev_t**2*(1-sigma)/(2*sigma))*dt
+    prev_sample_mean = latents*(1 + std_dev_t**2/(2*sigma)*dt)+model_output*(1+std_dev_t**2*(1-sigma)/(2*sigma))*dt
     
     if prev_sample is None:
         variance_noise = randn_tensor(
@@ -210,7 +209,7 @@ def flow_grpo_step(
 
     return prev_sample, pred_original_sample, log_prob, prev_sample_mean, std_dev_t * torch.sqrt(-1*dt)
 
-def dance_grpo_step(
+def dance_grpo_denoising_step(
     model_output: torch.Tensor,
     latents: torch.Tensor,
     eta: float,
@@ -219,7 +218,7 @@ def dance_grpo_step(
     prev_sample: torch.Tensor,
     grpo: bool,
     sde_solver: bool,
-):
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     sigma = sigmas[index]
     dsigma = sigmas[index + 1] - sigma # neg dt
     prev_sample_mean = latents + dsigma * model_output
@@ -244,14 +243,13 @@ def dance_grpo_step(
         # log prob of prev_sample given prev_sample_mean and std_dev_t
         log_prob = (
             -((prev_sample.detach().to(torch.float32) - prev_sample_mean.to(torch.float32)) ** 2) / (2 * (std_dev_t**2))
-        )
-        - math.log(std_dev_t)- torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
+        ) - math.log(std_dev_t) - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
 
         # mean along all but batch dimension
         log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
         return prev_sample, pred_original_sample, log_prob
     else:
-        return prev_sample_mean,pred_original_sample
+        return prev_sample_mean, pred_original_sample
 
 @dataclass
 class DPMState:
@@ -271,7 +269,7 @@ class DPMState:
         if self.lower_order_nums < self.order:
             self.lower_order_nums += 1
 
-def dpm_step(
+def dpm_denoising_step(
     args,
     model_output: torch.Tensor,
     sample: torch.Tensor,

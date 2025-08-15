@@ -13,7 +13,7 @@ import json
 import random
 import numpy as np
 from fastvideo.dataset.latent_flux_rl_datasets import LatentDataset, latent_collate_function
-from fastvideo.utils.sampling_utils import flow_grpo_step, dance_grpo_step, run_sample_step, sd3_time_shift, dpm_step
+from fastvideo.utils.sampling_utils import flow_grpo_denoising_step, dance_grpo_denoising_step, sample_diffusion_trajectory, timesteps_shift, dpm_denoising_step
 from tqdm.auto import tqdm
 from diffusers.image_processor import VaeImageProcessor
 from fastvideo.utils.communications_flux import sp_parallel_dataloader_wrapper
@@ -105,7 +105,7 @@ def sample_reference_model(
     sample_steps = args.sampling_steps
     sigma_schedule = torch.linspace(1, 0, args.sampling_steps + 1).to(device)
     
-    sigma_schedule = sd3_time_shift(args.shift, sigma_schedule)
+    sigma_schedule = timesteps_shift(args.shift, sigma_schedule)
 
     assert_eq(
         len(sigma_schedule),
@@ -156,7 +156,7 @@ def sample_reference_model(
             determistic[i] = False
 
         with torch.no_grad():
-            z, latents, batch_latents, batch_log_probs = run_sample_step(
+            z, latents, batch_latents, batch_log_probs = sample_diffusion_trajectory(
                 args,
                 input_latents_new,
                 progress_bar,
