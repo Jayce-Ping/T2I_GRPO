@@ -44,17 +44,16 @@ unified_reward_default_question_type="semantic"
 unified_reward_num_workers=1
 
 # Dataset
-data_json_path="data/rl_embeddings/prompt.json"
-test_data_json_path="data/rl_embeddings_test/prompt.json"
+# data_json_path="data/rl_embeddings/prompt.json"
+# test_data_json_path="data/rl_embeddings_test/prompt.json"
 
-# data_json_path="data/rl_embeddings_ocr/prompt.json" # For ocr task
-# test_data_json_path="data/rl_embeddings_ocr_test/prompt.json"
+data_json_path="data/rl_embeddings_ocr/prompt.json" # For ocr task
+test_data_json_path="data/rl_embeddings_ocr_test/prompt.json"
 
 
 # MixGRPO Hyperparameters
-experiment_prefix="exp_2"
-# reward_model="ocr_score"
-reward_model="clip_score"
+experiment_prefix="exp_3"
+reward_model="ocr_score"
 experiment_name="${experiment_prefix}_${reward_model}"
 # "hpsv2", "clip_score" "image_reward", "ocr_score", "pick_score", "unified_reward", "hpsv2_clip_score", "multi_reward"
 seed=714
@@ -64,7 +63,7 @@ sampling_steps=25
 eta=0.7
 kl_coeff=0.0
 iters_per_group=25
-group_size=4
+window_size=4
 sample_strategy="progressive"
 prog_overlap_step=1
 trimmed_ratio=0.0
@@ -78,6 +77,10 @@ gradient_accumulation_steps=4
 h=1024
 w=1024
 t=1
+train_batch_size=1
+test_batch_size=1
+num_eval_samples=6
+num_generations=12
 
 # DanceGRPO Sampling Parameters
 timestep_fraction=0.6
@@ -139,10 +142,9 @@ torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_p
     --data_json_path $data_json_path \
     --test_data_json_path $test_data_json_path \
     --gradient_checkpointing \
-    --train_batch_size 2 \
-    --sample_batch_size 2 \
-    --num_generations 16 \
-    --test_batch_size 2 \
+    --train_batch_size $train_batch_size \
+    --num_generations $num_generations \
+    --test_batch_size $test_batch_size \
     --num_latent_t 1 \
     --sp_size 1 \
     --train_sp_batch_size 1 \
@@ -178,7 +180,7 @@ torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_p
     --experiment_name $experiment_name \
     --kl_coeff $kl_coeff \
     --iters_per_group $iters_per_group \
-    --group_size $group_size \
+    --window_size $window_size \
     --sample_strategy $sample_strategy \
     --prog_overlap \
     --prog_overlap_step $prog_overlap_step \

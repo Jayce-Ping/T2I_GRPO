@@ -1,5 +1,6 @@
 import concurrent.futures
 import random
+from typing import List, Tuple, Dict
 
 def _compute_single_reward(reward_model, images, input_prompts):
     """Compute reward for a single reward model."""
@@ -42,7 +43,7 @@ def _compute_single_reward(reward_model, images, input_prompts):
     except Exception as e:
         raise ValueError(f"Error in _compute_single_reward with {reward_model_name}: {e}") from e
 
-def compute_reward(images, input_prompts, reward_model):
+def compute_reward(images, input_prompts, reward_model) -> Tuple[List[float], List[int]]:
         assert (
             len(images) == len(input_prompts)
         ), f"length of `images` ({len(images)}) must be equal to length of `input_prompts` ({len(input_prompts)})"

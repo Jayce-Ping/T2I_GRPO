@@ -44,12 +44,6 @@ from tqdm.auto import tqdm
 
 from fastvideo.dataset.latent_flux_rl_datasets import LatentDataset, latent_collate_function
 from fastvideo.reward.reward_model import RewardModel
-from fastvideo.reward.clip_score import CLIPScoreRewardModel
-from fastvideo.reward.hps_score import HPSClipRewardModel
-from fastvideo.reward.image_reward import ImageRewardModel
-from fastvideo.reward.ocr_score import OcrRewardModel
-from fastvideo.reward.pick_score import PickScoreRewardModel
-from fastvideo.reward.unified_reward import UnifiedRewardModel
 from fastvideo.reward.utils import balance_pos_neg, compute_reward
 from fastvideo.utils.checkpoint import save_checkpoint, save_lora_checkpoint
 from fastvideo.utils.communications_flux import sp_parallel_dataloader_wrapper
@@ -173,7 +167,7 @@ def compute_log_probs(
     B = encoder_hidden_states.shape[0]
     transformer.train()
     with torch.autocast("cuda", torch.bfloat16):
-        pred= transformer(
+        pred = transformer(
             hidden_states=latents,
             encoder_hidden_states=encoder_hidden_states,
             timestep= timesteps / 1000,
@@ -307,6 +301,9 @@ def sample_reference_model(
             reward_model
         )
 
+    if isinstance(rewards, list):
+        rewards = torch.tensor(rewards, device=device, dtype=torch.float32)
+
     return rewards, all_latents, all_log_probs, sigma_schedule
 
 
@@ -331,10 +328,7 @@ def train_one_step(
     timesteps_train : List[int],
     global_step : int
 ) -> Dict[str, Union[float, torch.Tensor]]:
-    total_loss = 0.0
-    kl_total_loss = 0.0
-    policy_total_loss = 0.0
-    total_clip_frac = 0.0
+
 
     optimizer.zero_grad()
 
@@ -346,6 +340,7 @@ def train_one_step(
     ) = train_batch
 
     B = encoder_hidden_states.shape[0] # = args.train_batch_size
+    print("Input encoder hidden stats shape", encoder_hidden_states.shape)
     w, h = args.w, args.h
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
     # Latest flux only requires 2-D dimensional tensor of image_ids, no batch dimention.
@@ -377,7 +372,7 @@ def train_one_step(
     timesteps =  torch.tensor(timestep_values, device=all_latents.device, dtype=torch.long)
 
     samples = {
-        "timesteps": timesteps.detach().clone()[:, :-1],
+        "timesteps": timesteps.detach()[:, :-1],
         "latents": all_latents[:, :-2],  # each entry is the latent before timestep t
         "next_latents": all_latents[:, 1:-1],  # each entry is the latent after timestep t
         "log_probs": all_log_probs[:, :-1],
@@ -392,24 +387,27 @@ def train_one_step(
         print(f"gathered_{args.reward_model}:", gathered_reward)
 
     # Compute advantages
-    if args.use_group:
-        # Compute advantages for each prompt
-        n = len(samples["rewards"]) // (args.num_generations)
-        advantages = torch.zeros_like(samples["rewards"])
+    print("Start to compute advantages")
+    advantages = (samples["rewards"] - gathered_reward.mean())/(gathered_reward.std()+1e-8)
+    samples["advantages"] = advantages
+    # if args.use_group:
+    #     # Compute advantages for each prompt
+    #     n = len(samples["rewards"]) // (args.num_generations)
+    #     advantages = torch.zeros_like(samples["rewards"])
         
-        for i in range(n):
-            start_idx = i * args.num_generations
-            end_idx = (i + 1) * args.num_generations
-            group_rewards = samples["rewards"][start_idx:end_idx]
-            group_mean = group_rewards.mean()
-            group_std = group_rewards.std() + 1e-8
-            advantages[start_idx:end_idx] = (group_rewards - group_mean) / group_std
+    #     for i in range(n):
+    #         start_idx = i * args.num_generations
+    #         end_idx = (i + 1) * args.num_generations
+    #         group_rewards = samples["rewards"][start_idx:end_idx]
+    #         group_mean = group_rewards.mean()
+    #         group_std = group_rewards.std() + 1e-8
+    #         advantages[start_idx:end_idx] = (group_rewards - group_mean) / group_std
         
-        samples["advantages"] = advantages
-    else:
-        # Compute advantages globally
-        advantages = (samples["rewards"] - gathered_reward.mean())/(gathered_reward.std()+1e-8)
-        samples["advantages"] = advantages
+    #     samples["advantages"] = advantages
+    # else:
+    #     # Compute advantages globally
+    #     advantages = (samples["rewards"] - gathered_reward.mean())/(gathered_reward.std()+1e-8)
+    #     samples["advantages"] = advantages
 
     time_perms = torch.stack(
         [
@@ -417,6 +415,7 @@ def train_one_step(
             for _ in range(B)
         ]
     ).to(device)
+
     for key in ["timesteps", "latents", "next_latents", "log_probs"]:
         samples[key] = samples[key][
             torch.arange(B).to(device)[:, None],
@@ -439,9 +438,11 @@ def train_one_step(
     if dist.get_rank() == 0:
         optimize_sampling_time = 0
 
+
+    total_loss = 0.0
+
+    print("Start to compute log probabilities and advantages")
     for i, sample in enumerate(samples_batched_list):
-        # Why dont use the whole batch to compute?
-        # TODO
         for t in timesteps_train:
             if dist.get_rank() == 0:
                 meta_optimize_sampling_time = time.time()
@@ -486,12 +487,9 @@ def train_one_step(
 
             loss.backward()
 
-            # Use one single tensor to stack all loss tensors
-            loss_info = torch.stack([l.detach().clone() for l in [loss, policy_loss, kl_loss, clip_frac]])
-            # Use one single tensor for efficient communication
-            dist.all_reduce(loss_info, op=dist.ReduceOp.AVG)
-            for l, total in zip(loss_info, [total_loss, policy_total_loss, kl_total_loss, total_clip_frac]):
-                total += l.item()
+            with torch.no_grad():
+                total_loss += loss.item()
+                
 
         if (i + 1) % args.gradient_accumulation_steps == 0:
             grad_norm = transformer.clip_grad_norm_(max_grad_norm)
@@ -518,11 +516,11 @@ def train_one_step(
 def evaluate(
     args : Namespace,
     device : int,
-    transformer : torch.nn.Module,
-    vae : torch.nn.Module,
-    reward_model : torch.nn.Module,
+    transformer : FluxTransformer2DModel,
+    vae : AutoencoderKL,
+    reward_model : RewardModel,
     global_step : int,
-    test_dataloader : torch.utils.data.DataLoader,
+    test_dataloader : DataLoader,
     num_eval_samples : int = 6
 ):
     """
@@ -544,13 +542,9 @@ def evaluate(
     # Set a max_eval_num for efficiency
     max_eval_num = 1
 
-    # Some shared variables for the evaluation
-    image_ids = prepare_latent_image_ids(latent_h // 2, latent_w // 2, device, torch.bfloat16)
-
-
-    all_eval_results_for_logging = []
-
     with torch.no_grad():
+        all_eval_results_for_logging = []
+        image_ids = prepare_latent_image_ids(latent_h // 2, latent_w // 2, device, torch.bfloat16)
         dataloader_progress = tqdm(
             test_dataloader,
             desc="Evaluation Batches", 
@@ -569,26 +563,17 @@ def evaluate(
             if len(all_eval_results_for_logging) >= max_eval_num:
                 break
 
-            num_prompts_in_batch = len(eval_prompts)
-            total_samples_to_generate = num_prompts_in_batch * num_eval_samples
+            B = encoder_hidden_states_batch.shape[0]
 
-            generator = torch.Generator(device=device)
-            if args.seed is not None:
-                generator.manual_seed(args.seed + rank)
-
-            batched_encoder_hidden_states = encoder_hidden_states_batch.repeat_interleave(num_eval_samples, dim=0)
-            batched_pooled_prompt_embeds = pooled_prompt_embeds_batch.repeat_interleave(num_eval_samples, dim=0)
-            
             input_latents = torch.randn(
-                (total_samples_to_generate, IN_CHANNELS, latent_h, latent_w),
+                (B, IN_CHANNELS, latent_h, latent_w),
                 device=device,
-                dtype=torch.bfloat16,
-                generator=generator
+                dtype=torch.bfloat16
             )
 
             text_ids = text_ids_batch[0].unsqueeze(0)
 
-            input_latents_packed = pack_latents(input_latents, total_samples_to_generate, IN_CHANNELS, latent_h, latent_w)
+            input_latents_packed = pack_latents(input_latents, B, IN_CHANNELS, latent_h, latent_w)
 
             progress_bar = tqdm(range(0, args.sampling_steps), desc="Batched Sampling for Eval", disable=(rank!=0))
             with torch.autocast("cuda", torch.bfloat16):
@@ -599,8 +584,8 @@ def evaluate(
                     progress_bar,
                     sigma_schedule,
                     transformer,
-                    batched_encoder_hidden_states,
-                    batched_pooled_prompt_embeds,
+                    encoder_hidden_states_batch,
+                    pooled_prompt_embeds_batch,
                     text_ids,
                     image_ids,
                     grpo_sample=True,
@@ -620,11 +605,9 @@ def evaluate(
                     # decoded_images = [image_processor.postprocess(img)[0] for img in images_tensor]
                     decoded_images = image_processor.postprocess(images_tensor, output_type='pil')
 
-            # Compute rewards for the entire batch
-            batched_prompts = [prompt for prompt in eval_prompts for _ in range(num_eval_samples)]
             all_rewards, success = compute_reward(
                 decoded_images,
-                batched_prompts,
+                eval_prompts,
                 reward_model
             )
 
@@ -644,8 +627,7 @@ def evaluate(
         
         if rank == 0:
             dataloader_progress.set_postfix({
-                'prompts_processed': num_prompts_in_batch,
-                'total_results': len(all_eval_results_for_logging)
+                'prompts_processed': len(all_eval_results_for_logging)
             })
 
     # All processes wait here until evaluation is done on all of them.
@@ -737,15 +719,16 @@ def main(args):
             json.dump(args_dict, f, indent=4)
     # For mixed precision training we cast all non-trainable weigths to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required
-    
     ############################# Build reward models #############################
     if args.reward_model == "hpsv2":
+        from fastvideo.reward.hps_score import HPSClipRewardModel
         reward_model = HPSClipRewardModel(
             device=device,
             clip_ckpt_path=args.hps_clip_path,
             hps_ckpt_path=args.hps_path,
         )
     elif args.reward_model == "image_reward":
+        from fastvideo.reward.image_reward import ImageRewardModel
         reward_model = ImageRewardModel(
             model_name=args.image_reward_path,
             device=device,
@@ -754,21 +737,25 @@ def main(args):
             https_proxy=args.image_reward_https_proxy,
         )
     elif args.reward_model == "clip_score":
+        from fastvideo.reward.clip_score import CLIPScoreRewardModel
         reward_model = CLIPScoreRewardModel(
             clip_model_path=args.clip_score_path,
             device=device,
         )
     elif args.reward_model == "pick_score":
+        from fastvideo.reward.pick_score import PickScoreRewardModel
         reward_model = PickScoreRewardModel(
             device=device,
             http_proxy=args.pick_score_http_proxy,
             https_proxy=args.pick_score_https_proxy,
         )
     elif args.reward_model == "ocr_score":
+        from fastvideo.reward.ocr_score import OcrRewardModel
         reward_model = OcrRewardModel(
             device_id=device
         )
     elif args.reward_model == "unified_reward":
+        from fastvideo.reward.unified_reward import UnifiedRewardModel
         unified_reward_urls = args.unified_reward_url.split(",")
         
         if isinstance(unified_reward_urls, list):
@@ -789,11 +776,13 @@ def main(args):
     main_print(f"--> loading model from {args.pretrained_model_name_or_path}")
     # keep the master weight to float32
 
+
     transformer = FluxTransformer2DModel.from_pretrained(
             args.pretrained_model_name_or_path,
             subfolder="transformer",
             torch_dtype = torch.float32
     )
+
 
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -801,10 +790,11 @@ def main(args):
         torch_dtype = torch.bfloat16,
     ).to(device)
 
+
     fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
         transformer,
         args.fsdp_sharding_startegy,
-        False,
+        args.use_lora,
         args.use_cpu_offload,
         args.master_weight_type,
     )
@@ -829,6 +819,20 @@ def main(args):
     params_to_optimize = transformer.parameters()
     params_to_optimize = list(filter(lambda p: p.requires_grad, params_to_optimize))
 
+    if args.use_lora:
+        from peft import LoraConfig, get_peft_model
+        
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            target_modules=args.lora_target_modules,
+            lora_dropout=args.lora_dropout
+        )
+        transformer = get_peft_model(transformer, lora_config)
+        
+        main_print(f"LoRA enabled with rank {args.lora_rank}")
+        main_print(f"Trainable parameters: {sum(p.numel() for p in transformer.parameters() if p.requires_grad):,}")
+        main_print(f"Total parameters: {sum(p.numel() for p in transformer.parameters()):,}")
 
     #-----------------------------Optimizer------------------------
     optimizer = torch.optim.AdamW(
@@ -926,6 +930,8 @@ def main(args):
     # print dtype
     main_print(f"  Master weight dtype: {transformer.parameters().__next__().dtype}")
 
+    # assert (args.test_batch_size * world_size) % args.num_eval_samples == 0, "Please make sure that the total test batch size (test_batch_size * world_size) is divisible by the number of repetition of each prompt (num_eval_samples)."
+
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         assert NotImplementedError("resume_from_checkpoint is not supported now.")
@@ -989,8 +995,21 @@ def main(args):
                     # Remove the oldest checkpoint directory
                     existing_checkpoints.sort()
                     shutil.rmtree(os.path.join(checkpoint_saving_dir, existing_checkpoints[0]))
-
-                save_checkpoint(transformer, rank, checkpoint_saving_dir, step, epoch)
+                
+                if args.use_lora:
+                    temp_pipeline = FluxPipeline.from_pretrained(
+                        args.pretrained_model_name_or_path,
+                        transformer=None,
+                        text_encoder=None,
+                        text_encoder_2=None,
+                        torch_dtype=torch.bfloat16,
+                    )
+                    temp_pipeline.transformer = None
+                    temp_pipeline.text_encoder = None
+                    temp_pipeline.text_encoder_2 = None
+                    save_lora_checkpoint(transformer, optimizer, rank, checkpoint_saving_dir, step, temp_pipeline, epoch)
+                else:
+                    save_checkpoint(transformer, rank, checkpoint_saving_dir, step, epoch)
 
                 if dist.is_initialized():
                     dist.barrier()
@@ -1061,14 +1080,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=16,
+        default=2,
         help="Batch size (per device) for the training dataloader.",
-    )
-    parser.add_argument(
-        "--sample_batch_size",
-        type=int,
-        default=4,
-        help="Batch size (per device) for the sampling dataloader.",
     )
     parser.add_argument(
         "--test_batch_size",
@@ -1342,6 +1355,50 @@ if __name__ == "__main__":
         default="null",
         choices=["random", "balance", "null"],
         help="Rerange strategy for advantages when computing loss"
+    )
+
+    #################### LoRA ####################
+    parser.add_argument(
+        "--use_lora",
+        action="store_true",
+        help="Whether to use LoRA fine-tuning",
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=64,
+        help="LoRA rank",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=64,
+        help="LoRA alpha parameter",
+    )
+    parser.add_argument(
+        "--lora_dropout",
+        type=float,
+        default=0.1,
+        help="LoRA dropout",
+    )
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        nargs="+",
+        default=["attn.to_k",
+            "attn.to_q",
+            "attn.to_v",
+            "attn.to_out.0",
+            "attn.add_k_proj",
+            "attn.add_q_proj",
+            "attn.add_v_proj",
+            "attn.to_add_out",
+            "ff.net.0.proj",
+            "ff.net.2",
+            "ff_context.net.0.proj",
+            "ff_context.net.2"
+        ],
+        help="Target modules for LoRA",
     )
 
     #################### MixGRPO ####################
