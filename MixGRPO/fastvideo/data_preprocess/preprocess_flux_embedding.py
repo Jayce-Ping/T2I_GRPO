@@ -12,19 +12,19 @@
 
 import argparse
 import torch
-from accelerate.logging import get_logger
 import cv2  
 import json
 import os
-import torch.distributed as dist
+import re
 from pathlib import Path  
 
 logger = get_logger(__name__)
+import torch.distributed as dist
 from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import re
+from accelerate.logging import get_logger
 from diffusers import FluxPipeline
 
 def contains_chinese(text):
@@ -98,36 +98,35 @@ def main(args):
     for _, data in tqdm(enumerate(train_dataloader), disable=local_rank != 0):
         try:
             with torch.inference_mode():
-                    if args.vae_debug:
-                        latents = data["latents"]
-                    for idx, video_name in enumerate(data["filename"]):
-                        prompt_embeds, pooled_prompt_embeds, text_ids = pipe.encode_prompt(
-                            prompt=data["caption"], prompt_2=data["caption"]
-                        )
-                        prompt_embed_path = os.path.join(
-                            args.output_dir, "prompt_embed", video_name + ".pt"
-                        )
-                        pooled_prompt_embeds_path = os.path.join(
-                            args.output_dir, "pooled_prompt_embeds", video_name + ".pt"
-                        )
-
-                        text_ids_path = os.path.join(
-                            args.output_dir, "text_ids", video_name + ".pt"
-                        )
-                        # save latent
-                        torch.save(prompt_embeds[idx], prompt_embed_path)
-                        torch.save(pooled_prompt_embeds[idx], pooled_prompt_embeds_path)
-                        torch.save(text_ids[idx], text_ids_path)
-                        item = {}
-                        item["prompt_embed_path"] = video_name + ".pt"
-                        item["text_ids"] = video_name + ".pt"
-                        item["pooled_prompt_embeds_path"] = video_name + ".pt"   
-                        item["caption"] = data["caption"][idx]             
-                        json_data.append(item)
+                if args.vae_debug:
+                    latents = data["latents"]
+                for idx, item_name in enumerate(data["filename"]):
+                    prompt_embeds, pooled_prompt_embeds, text_ids = pipe.encode_prompt(
+                        prompt=data["caption"], prompt_2=data["caption"]
+                    )
+                    prompt_embed_path = os.path.join(
+                        args.output_dir, "prompt_embed", item_name + ".pt"
+                    )
+                    pooled_prompt_embeds_path = os.path.join(
+                        args.output_dir, "pooled_prompt_embeds", item_name + ".pt"
+                    )
+                    text_ids_path = os.path.join(
+                        args.output_dir, "text_ids", item_name + ".pt"
+                    )
+                    # save latent
+                    torch.save(prompt_embeds[idx], prompt_embed_path)
+                    torch.save(pooled_prompt_embeds[idx], pooled_prompt_embeds_path)
+                    torch.save(text_ids[idx], text_ids_path)
+                    item = {}
+                    item["prompt_embed_path"] = item_name + ".pt"
+                    item["text_ids"] = item_name + ".pt"
+                    item["pooled_prompt_embeds_path"] = item_name + ".pt"   
+                    item["caption"] = data["caption"][idx]             
+                    json_data.append(item)
         except Exception as e:
             print(f"Rank {local_rank} Error: {repr(e)}")
             dist.barrier()
-            raise  # 重新抛出异常让程序终止
+            raise
     dist.barrier()
     local_data = json_data
     gathered_data = [None] * world_size

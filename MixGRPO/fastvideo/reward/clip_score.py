@@ -9,7 +9,7 @@ from PIL import Image
 import os
 from open_clip import create_model_from_pretrained, get_tokenizer
 import argparse 
-from .reward_model import RewardModel
+from fastvideo.reward.reward_model import RewardModel
 
 class CLIPScoreRewardModel(RewardModel):
     def __init__(self, clip_model_path, device, http_proxy=None, https_proxy=None, clip_model_type='ViT-H-14'):

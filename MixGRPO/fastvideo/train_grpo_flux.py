@@ -43,7 +43,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 from fastvideo.dataset.latent_flux_rl_datasets import LatentDataset, latent_collate_function
-from fastvideo.dataset.text_dataset import TextPromptDataset, JsonPromptDataset
+from fastvideo.reward.reward_model import RewardModel
 from fastvideo.reward.clip_score import CLIPScoreRewardModel
 from fastvideo.reward.hps_score import HPSClipRewardModel
 from fastvideo.reward.image_reward import ImageRewardModel
@@ -219,7 +219,7 @@ def compute_log_probs(
 
 def sample_reference_model(
     args : Namespace,
-    device : torch.device,
+    device : torch.device | int,
     transformer : FluxTransformer2DModel,
     vae : AutoencoderKL,
     encoder_hidden_states : torch.Tensor, 
@@ -318,20 +318,9 @@ def gather_tensor(tensor : torch.Tensor) -> torch.Tensor:
     dist.all_gather(gathered_tensors, tensor)
     return torch.cat(gathered_tensors, dim=0)
 
-def gather_objects(local_results : Any, rank, world_size) -> List[Any]:
-    gathered_results = [_ for _ in range(world_size)]
-    dist.gather_object(local_results, gathered_results, dst=rank)
-    
-    # Merge all object
-    all_results = []
-    for results in gathered_results:
-        all_results.append(results)
-
-    return all_results
-
 def train_one_step(
     args : Namespace,
-    device : torch.device,
+    device : torch.device | int,
     transformer : FluxTransformer2DModel,
     vae : AutoencoderKL,
     reward_model : RewardModel,
@@ -356,7 +345,7 @@ def train_one_step(
         caption,
     ) = train_batch
 
-    B = encoder_hidden_states.shape[0] # = args.num_generations * args.train_batch_size
+    B = encoder_hidden_states.shape[0] # = args.train_batch_size
     w, h = args.w, args.h
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
     # Latest flux only requires 2-D dimensional tensor of image_ids, no batch dimention.
@@ -451,6 +440,8 @@ def train_one_step(
         optimize_sampling_time = 0
 
     for i, sample in enumerate(samples_batched_list):
+        # Why dont use the whole batch to compute?
+        # TODO
         for t in timesteps_train:
             if dist.get_rank() == 0:
                 meta_optimize_sampling_time = time.time()
@@ -525,27 +516,25 @@ def train_one_step(
 
 
 def evaluate(
-    args,
-    device,
-    transformer,
-    vae,
-    reward_model,
-    global_step,
-    test_dataloader,
-    num_eval_samples=6
+    args : Namespace,
+    device : int,
+    transformer : torch.nn.Module,
+    vae : torch.nn.Module,
+    reward_model : torch.nn.Module,
+    global_step : int,
+    test_dataloader : torch.utils.data.DataLoader,
+    num_eval_samples : int = 6
 ):
     """
     Evaluate the model on the given prompts and log on wandb
     """
     rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
 
     # Only print from the main process
     if rank == 0:
         print(f"Starting evaluation at step {global_step}")
 
     w, h = args.w, args.h
-    sample_steps = args.sampling_steps
     sigma_schedule = torch.linspace(1, 0, args.sampling_steps + 1).to(device)
     sigma_schedule = timesteps_shift(args.shift, sigma_schedule)
 
@@ -666,13 +655,6 @@ def evaluate(
 
     # Log on wandb for the main process
     if rank == 0:
-
-        # Gather all all_eval_results_for_logging from all GPUs ( Realy slow, why???)
-        # gathered_eval_results = gather_objects(all_eval_results_for_logging, rank, world_size)
-
-        # gathered_eval_results = [item for sublist in gathered_eval_results for item in sublist]
-
-
         log_start_time = time.time()
         with tempfile.TemporaryDirectory() as tmpdir:
             wandb_log_dict = {
@@ -721,6 +703,7 @@ def evaluate(
     
     if dist.is_initialized():
         dist.barrier()
+
 
 def main(args):
     ############################# Init #############################
@@ -901,13 +884,13 @@ def main(args):
         num_workers=args.dataloader_num_workers,
         drop_last=True,
     )
-    train_dataloader = iter(train_dataloader)
+
     test_dataloader = DataLoader(
         test_dataset,
         sampler=test_sampler,
         collate_fn=latent_collate_function,
         pin_memory=True,
-        batch_size=args.train_batch_size,
+        batch_size=args.test_batch_size,
         num_workers=args.dataloader_num_workers,
         drop_last=True,
     )
@@ -979,7 +962,7 @@ def main(args):
         if isinstance(train_sampler, DistributedSampler):
             train_sampler.set_epoch(epoch) # Crucial for distributed shuffling per epoch
 
-        for step in range(init_steps+1, args.max_train_steps+1):
+        for step, train_batch in zip(range(init_steps+1, args.max_train_steps+1), train_dataloader):
             global_step += 1
             # Do evaluation every args.eval_steps
             if args.enable_eval and global_step % args.eval_steps == 0:
@@ -1027,7 +1010,7 @@ def main(args):
                 reward_model,
                 optimizer,
                 lr_scheduler,
-                train_dataloader,
+                train_batch,
                 args.max_grad_norm,
                 timesteps_train,
                 global_step

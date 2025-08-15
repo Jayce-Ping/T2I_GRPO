@@ -9,7 +9,7 @@ import re
 from fastvideo.reward.reward_model import RewardModel
 
 class OcrRewardModel(RewardModel):
-    def __init__(self, device: str):
+    def __init__(self, device_id: int):
         """
         OCR reward calculator
         device : str - device to load PaddleOCR model
