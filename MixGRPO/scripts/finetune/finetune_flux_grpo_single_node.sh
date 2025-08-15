@@ -141,6 +141,7 @@ torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_p
     --gradient_checkpointing \
     --train_batch_size 2 \
     --sample_batch_size 2 \
+    --num_generations 16 \
     --test_batch_size 2 \
     --num_latent_t 1 \
     --sp_size 1 \
@@ -152,7 +153,7 @@ torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_p
     --learning_rate 1e-5 \
     --mixed_precision bf16 \
     --checkpointing_steps 5 \
-    --num_eval_samples 6 \
+    --num_eval_samples 8 \
     --eval_steps 5 \
     --allow_tf32 \
     --cfg 0.0 \
@@ -166,7 +167,6 @@ torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_p
     --sampler_seed $sampler_seed \
     --max_grad_norm 1.0 \
     --weight_decay 0.0001 \
-    --num_generations 16 \
     --shift 3 \
     --use_group \
     --ignore_last \

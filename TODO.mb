@@ -1,5 +1,14 @@
-# 7.17
+# 8.14
 
 - Add eval set for MixGRPO, compute average rewards for eval set ✅
 
 - Add New reward model - OCR✅, T2IS
+
+
+# 8.15
+
+- Update DistributeSampler and Dataset
+
+- Figure out how data are loaded
+
+- Use single reward model in the traning code. DO NOT USE linear reward_weights dict ✅

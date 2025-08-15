@@ -27,7 +27,7 @@ from fastvideo.utils.parallel_states import (
 from fastvideo.utils.communications_flux import sp_parallel_dataloader_wrapper
 # from fastvideo.utils.validation import log_validation
 import time
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -77,6 +77,29 @@ from fastvideo.utils.sampling_utils import flow_grpo_step, dance_grpo_step, run_
 
 def assert_eq(x, y, msg=None):
     assert x == y, f"{msg or 'Assertion failed'}: {x} != {y}"
+
+
+class DistributedKRepeatSampler(DistributedSampler):
+    def __init__(self, dataset : Dataset, num_replicas=None, rank=None, shuffle=True, seed=0, k=1):
+        super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle, seed=seed)
+        
+        # Number of times to repeat each index
+        self.k = k
+        # Original dataset len
+        self.original_len = len(self.dataset)
+
+    def __iter__(self):
+        # Get the indices for the current replica
+        indices_per_replica = list(super().__iter__())
+        
+        # Repeat each index k times
+        repeated_indices = [idx for idx in indices_per_replica for _ in range(self.k)]
+        
+        return iter(repeated_indices)
+    
+    def __len__(self):
+        return super().__len__() * self.k
+
 
 def prepare_latent_image_ids(batch_size, height, width, device, dtype):
     latent_image_ids = torch.zeros(height, width, 3)
@@ -173,17 +196,16 @@ def grpo_one_step(
 
 def sample_reference_model(
     args,
-    device, 
+    device,
     transformer,
     vae,
     encoder_hidden_states, 
     pooled_prompt_embeds, 
     text_ids,
-    reward_models,
-    caption,
+    reward_model,
+    captions,
     timesteps_train, # index
-    global_step, 
-    reward_weights,
+    global_step
 ):
     w, h, t = args.w, args.h, args.t
     sample_steps = args.sampling_steps
@@ -196,24 +218,18 @@ def sample_reference_model(
         sample_steps + 1,
         "sigma_schedule must have length sample_steps + 1",
     )
-
+    w, h, t = args.w, args.h, args.t
     B = encoder_hidden_states.shape[0] # = args.num_generations * args.train_batch_size
     SPATIAL_DOWNSAMPLE = 8
     IN_CHANNELS = 16
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
 
+    image_ids = prepare_latent_image_ids(B, latent_h // 2, latent_w // 2, device, torch.bfloat16)
+
     sample_batch_size = args.sample_batch_size
     assert sample_batch_size <= args.num_generations, "sample_batch_size must be less than num_generations"
     assert args.num_generations % sample_batch_size == 0, "num_generations must be divisible by sample_batch_size"
 
-    batch_indices = torch.chunk(torch.arange(B), B // sample_batch_size) #[[1, 2, ..., sample_batch_size]]
-
-    all_latents = []
-    all_log_probs = []
-    all_rewards = []
-    all_multi_rewards = {}
-    all_image_ids = []
-    all_images = []
     if args.init_same_noise:
         input_latents = torch.randn(
                 (1, IN_CHANNELS, latent_h, latent_w),
@@ -221,129 +237,63 @@ def sample_reference_model(
                 dtype=torch.bfloat16,
             )
         # Repeat input_latents on the dim=0
-        input_latents = input_latents.repeat(sample_batch_size, 1, 1, 1)
-    
-
-    # Latest flux only requires 2-D dimensional tensor of image_ids, no batch dimention.
-    image_ids = prepare_latent_image_ids(sample_batch_size, latent_h // 2, latent_w // 2, device, torch.bfloat16)
-
-    if dist.get_rank() == 0:
-        sampling_time = 0
-    
-    for index, batch_idx in enumerate(batch_indices):
-        if dist.get_rank() == 0:
-            meta_sampling_time = time.time()
-        
-        batch_encoder_hidden_states = encoder_hidden_states[batch_idx]
-        batch_pooled_prompt_embeds = pooled_prompt_embeds[batch_idx]
-
-        batch_caption = [caption[i] for i in batch_idx]
-        if not args.init_same_noise:
-            input_latents = torch.randn(
-                    (sample_batch_size, IN_CHANNELS, latent_h, latent_w),
+        input_latents = input_latents.repeat(B, 1, 1, 1)
+    else:
+        input_latents = torch.randn(
+                    (B, IN_CHANNELS, latent_h, latent_w),
                     device=device,
                     dtype=torch.bfloat16,
                 )
-        input_latents_new = pack_latents(input_latents, sample_batch_size, IN_CHANNELS, latent_h, latent_w)
 
-        grpo_sample=True
-        progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress", disable=not dist.is_initialized() or dist.get_rank() != 0)
+    input_latents = pack_latents(input_latents, B, IN_CHANNELS, latent_h, latent_w)
 
-        if args.training_strategy == "part":
-            determistic = [True] * sample_steps
-            for i in timesteps_train:
-                determistic[i] = False
-        elif args.training_strategy == "all":
-            determistic = [False] * sample_steps
+    grpo_sample = True
 
-        with torch.no_grad():
-            z, latents, batch_latents, batch_log_probs = run_sample_step(
-                args,
-                input_latents_new,
-                progress_bar,
-                sigma_schedule,
-                transformer,
-                batch_encoder_hidden_states,
-                batch_pooled_prompt_embeds,
-                text_ids, # 2D tensor
-                image_ids, # 2D tensor
-                grpo_sample,
-                determistic=determistic,
-            )
-        if dist.get_rank() == 0:
-            sampling_time += time.time() - meta_sampling_time
-            main_print(f"##### Sampling time per data: {sampling_time/(index+1)} seconds")
-        
-        all_image_ids.append(image_ids)
-        all_latents.append(batch_latents)
-        all_log_probs.append(batch_log_probs)
-        vae.enable_tiling()
-        
-        image_processor = VaeImageProcessor(do_resize=True)
-        rank = int(os.environ["RANK"])
-        
-        with torch.inference_mode():
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                latents = unpack_latents(latents, h, w, 8)
-                latents = (latents / 0.3611) + 0.1159
-                image = vae.decode(latents, return_dict=False)[0]
-                decoded_image = image_processor.postprocess(image)[0]
-                all_images.append(decoded_image)
+    if args.training_strategy == "part":
+        determistic = [True] * sample_steps
+        for i in timesteps_train:
+            determistic[i] = False
+    elif args.training_strategy == "all":
+        determistic = [False] * sample_steps
 
-        # compute rewards
-        with torch.no_grad():
-            images = [decoded_image]
-            prompts = [batch_caption[0]]
-            rewards, successes, rewards_dict, successes_dict = compute_reward(
-                images, 
-                prompts,
-                reward_models,
-                reward_weights,
-            )
-            if args.multi_reward_mix == "reward_aggr":
-                all_rewards.append(torch.tensor(rewards, device=device, dtype=torch.float32))
-            
-            elif args.multi_reward_mix == "advantage_aggr":
-                for model_name, model_rewards in rewards_dict.items():
-                    if model_name not in all_multi_rewards:
-                        all_multi_rewards[model_name] = {"rewards": [], "successes": []}
-                    all_multi_rewards[model_name]["rewards"].append(
-                        torch.tensor(model_rewards, device=device, dtype=torch.float32)
-                    )
-                    all_multi_rewards[model_name]["successes"].append(
-                        torch.tensor(successes_dict[model_name], device=device, dtype=torch.float32)
-                    )
+    progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress", disable=not dist.is_initialized() or dist.get_rank() != 0)
 
-    # TODO: add the logic code for verifying success
-    all_latents = torch.cat(all_latents, dim=0)
-    all_log_probs = torch.cat(all_log_probs, dim=0)
+    z, latents, all_latents, all_log_probs = run_sample_step(
+            args,
+            input_latents,
+            progress_bar,
+            sigma_schedule,
+            transformer,
+            encoder_hidden_states,
+            pooled_prompt_embeds,
+            text_ids, # 2D tensor
+            image_ids, # 2D tensor
+            grpo_sample,
+            determistic=determistic,
+        )
 
-    if args.multi_reward_mix == "reward_aggr":
-        all_rewards_res = torch.cat(all_rewards, dim=0)
 
-    elif args.multi_reward_mix == "advantage_aggr":
-        all_rewards_res = {}
-        for model_name, model_rewards in all_multi_rewards.items():
-            all_rewards_res[model_name] = torch.cat(model_rewards["rewards"], dim=0)
+    vae.enable_tiling()
+    
+    image_processor = VaeImageProcessor(do_resize=True)
+    rank = int(os.environ["RANK"])
+    
+    with torch.inference_mode():
+        with torch.autocast("cuda", torch.bfloat16):
+            latents_unpacked = unpack_latents(latents, h, w, 8)
+            latents_unpacked = (latents_unpacked / 0.3611) + 0.1159
+            # Decode all images in one go
+            images_tensor = vae.decode(latents_unpacked, return_dict=False)[0]
+            # decoded_images = [image_processor.postprocess(img)[0] for img in images_tensor]
+            decoded_images = image_processor.postprocess(images_tensor, output_type='pil')
 
-    all_image_ids = torch.stack(all_image_ids, dim=0)
+    rewards, successes = compute_reward(
+            decoded_images, 
+            captions,
+            reward_model
+        )
 
-    # Upload images and statatics of rewards on wandb
-    # if dist.get_rank() == 0 and global_step % 2 == 0:
-    #     with tempfile.TemporaryDirectory() as tmpdir:
-    #         wandb_images = []
-    #         image_paths = [os.path.join(tmpdir, f"{i}.jpg") for i in range(len(all_images))]
-    #         for i, (img, reward) in enumerate(zip(all_images, all_rewards)):
-    #             img.save(image_paths[i], format="JPEG")
-    #             wandb_images.append(wandb.Image(img, caption=f"Reward {reward.mean().item():.2f}"))
-            
-    #         wandb.log({
-    #             "Sampling Images": wandb_images,
-    #         },
-    #         step=global_step
-    #         )
-
-    return all_rewards_res, all_latents, all_log_probs, sigma_schedule, all_image_ids
+    return rewards, all_latents, all_log_probs, sigma_schedule, image_ids
 
 
 def gather_tensor(tensor):
@@ -354,20 +304,30 @@ def gather_tensor(tensor):
     dist.all_gather(gathered_tensors, tensor)
     return torch.cat(gathered_tensors, dim=0)
 
+def gather_objects(local_results : Any, rank, world_size) -> List[Any]:
+    gathered_results = [_ for _ in range(world_size)]
+    dist.gather_object(local_results, gathered_results, dst=rank)
+    
+    # Merge all object
+    all_results = []
+    for results in gathered_results:
+        all_results.append(results)
+
+    return all_results
+
 def train_one_step(
     args,
     device,
     transformer,
     vae,
-    reward_models,
+    reward_model,
     optimizer,
     lr_scheduler,
     loader,
     noise_scheduler,
     max_grad_norm,
     timesteps_train, # index
-    global_step,
-    reward_weights,
+    global_step
 ):
     total_loss = 0.0
     kl_total_loss = 0.0
@@ -382,31 +342,21 @@ def train_one_step(
         caption,
     ) = next(loader)
 
+    B = encoder_hidden_states.shape[0] # = args.num_generations * args.train_batch_size
+    w, h = args.w, args.h
+    SPATIAL_DOWNSAMPLE = 8
+    IN_CHANNELS = 16
+    latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
+    # Latest flux only requires 2-D dimensional tensor of image_ids, no batch dimention.
+    image_ids = prepare_latent_image_ids(B, latent_h // 2, latent_w // 2, device, torch.bfloat16)
 
-    if args.use_group:
-        def repeat_tensor(tensor):
-            if tensor is None:
-                return None
-            return torch.repeat_interleave(tensor, args.num_generations, dim=0)
+    # Note: No batch dimension required for both text_ids and img_ids, and all text_ids are the same.
+    # refer to https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_flux.py#L631
+    # line 700-711
+    # So reshape it to (1, 3) for canonicalization.
+    text_ids = text_ids[0].unsqueeze(0)
 
-        # Note: No batch dimension required for both text_ids and img_ids, and all text_ids are the same.
-        # refer to https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_flux.py#L631
-        # line 700-711
-        # So reshape it to (1, 3) for canonicalization.
-        text_ids = text_ids[0].unsqueeze(0)
-
-        encoder_hidden_states = repeat_tensor(encoder_hidden_states) # (num_generations * train_batch_size, ...)
-        pooled_prompt_embeds = repeat_tensor(pooled_prompt_embeds) # (num_generations * train_batch_size, ...)
-
-
-        if isinstance(caption, str):
-            caption = [caption] * args.num_generations
-        elif isinstance(caption, list):
-            caption = [item for item in caption for _ in range(args.num_generations)]
-        else:
-            raise ValueError(f"Unsupported caption type: {type(caption)}")
-
-    reward, all_latents, all_log_probs, sigma_schedule, all_image_ids = sample_reference_model(
+    rewards, all_latents, all_log_probs, sigma_schedule, _ = sample_reference_model(
             args,
             device,
             transformer,
@@ -414,11 +364,10 @@ def train_one_step(
             encoder_hidden_states,
             pooled_prompt_embeds,
             text_ids,
-            reward_models,
+            reward_model,
             caption,
             timesteps_train,
-            global_step,
-            reward_weights,
+            global_step
         )
     batch_size = all_latents.shape[0]
     timestep_value = [int(sigma * 1000) for sigma in sigma_schedule][:args.sampling_steps]
@@ -435,45 +384,31 @@ def train_one_step(
             :, 1:
         ][:, :-1],  # each entry is the latent after timestep t
         "log_probs": all_log_probs[:, :-1],
-        "image_ids": all_image_ids,
-        "text_ids": text_ids,
         "encoder_hidden_states": encoder_hidden_states,
         "pooled_prompt_embeds": pooled_prompt_embeds,
     }
 
-    if args.multi_reward_mix == "advantage_aggr":
-        samples["rewards"] = {}
-        gathered_reward = {}
-        for model_name, model_rewards in reward.items():
-            gathered_reward[model_name] = gather_tensor(model_rewards.to(torch.float32))
-            samples["rewards"][model_name] = model_rewards.to(torch.float32)
-    elif args.multi_reward_mix == "reward_aggr":
-        samples["rewards"] = reward.to(torch.float32)
-        gathered_reward = gather_tensor(samples["rewards"])
+    # TODO: Figure out reward dimensions here.
+
+    print(rewards)
+
+    samples["rewards"] = {}
+    gathered_reward = gather_tensor(rewards)
 
     if dist.get_rank()==0:
         print(f"gathered_{args.reward_model}:", gathered_reward)
-        for model_name, model_rewards in gathered_reward.items():
-            print(f"{model_name}: {model_rewards.mean().item()}")
-        reward_dir = f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}"
-        with open(f'{reward_dir}/flux_{args.reward_model}_{args.training_strategy}_{args.experiment_name}.txt', 'a') as f: 
-            if args.multi_reward_mix == "advantage_aggr":
-                for model_name, model_rewards in gathered_reward.items():
-                    f.write(f"{model_name}: {model_rewards.mean().item()}\n")
-            elif args.multi_reward_mix == "reward_aggr":
-                f.write(f"reward: {gathered_reward.mean().item()}\n")
 
     #计算advantage
     if args.use_group:
         if args.multi_reward_mix == "advantage_aggr":
             model_advantages = {}
             for model_name, model_rewards in samples["rewards"].items():
-                n = len(model_rewards) // (args.num_generations)
+                n = len(model_rewards) // B
                 advantages = torch.zeros_like(model_rewards)
 
                 for i in range(n):
-                    start_idx = i * args.num_generations
-                    end_idx = (i + 1) * args.num_generations
+                    start_idx = i * B
+                    end_idx = (i + 1) * B
                     group_rewards = model_rewards[start_idx:end_idx]
                     if args.trimmed_ratio > 0:
                         sorted_rewards = torch.sort(group_rewards)[0]
@@ -495,12 +430,12 @@ def train_one_step(
             samples["advantages"] = merged_advantages
         
         elif args.multi_reward_mix == "reward_aggr":
-            n = len(samples["rewards"]) // (args.num_generations)
+            n = len(samples["rewards"]) // B
             advantages = torch.zeros_like(samples["rewards"])
             
             for i in range(n):
-                start_idx = i * args.num_generations
-                end_idx = (i + 1) * args.num_generations
+                start_idx = i * B
+                end_idx = (i + 1) * B
                 group_rewards = samples["rewards"][start_idx:end_idx]
                 if args.trimmed_ratio > 0:
                     sorted_rewards = torch.sort(group_rewards)[0]
@@ -549,12 +484,16 @@ def train_one_step(
     samples_batched = {
         k: v.unsqueeze(1)
         for k, v in samples.items()
-        if k != "rewards"
+        if k not in ['rewards']
     }
+    # All values of samples_batched should have the same length
+    # assert len(set(len(v) for v in samples_batched.values())) == 1
+
     # dict of lists -> list of dicts for easier iteration
     samples_batched_list = [
         dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
     ]
+
     if args.training_strategy == "part":
         train_timesteps = timesteps_train
     elif args.training_strategy == "all":
@@ -579,23 +518,23 @@ def train_one_step(
     if dist.get_rank() == 0:
         optimize_sampling_time = 0
 
-    for i,sample in list(enumerate(samples_batched_list)):
-        for _ in train_timesteps:
+    for i, sample in enumerate(samples_batched_list):
+        for t in train_timesteps:
             if dist.get_rank() == 0:
                 meta_optimize_sampling_time = time.time()
             clip_range = args.clip_range
             adv_clip_max = args.adv_clip_max
             new_log_probs = grpo_one_step(
                 args,
-                sample["latents"][:,_],
-                sample["next_latents"][:,_],
+                sample["latents"][:,t],
+                sample["next_latents"][:,t],
                 sample["encoder_hidden_states"],
                 sample["pooled_prompt_embeds"],
-                sample["text_ids"],
-                sample["image_ids"],
+                text_ids,
+                image_ids,
                 transformer,
-                sample["timesteps"][:,_],
-                perms[i][_] if args.training_strategy == "all" else _,
+                sample["timesteps"][:,t],
+                perms[i][t] if args.training_strategy == "all" else t,
                 sigma_schedule,
             )
 
@@ -609,7 +548,7 @@ def train_one_step(
                 adv_clip_max,
             )
 
-            ratio = torch.exp(new_log_probs - sample["log_probs"][:,_])
+            ratio = torch.exp(new_log_probs - sample["log_probs"][:,t])
 
             unclipped_loss = -advantages * ratio
             clipped_loss = -advantages * torch.clamp(
@@ -619,7 +558,7 @@ def train_one_step(
             )
             clip_frac = torch.mean((torch.abs(ratio - 1.0) > clip_range).float())
             policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss)) / (args.gradient_accumulation_steps * len(train_timesteps))
-            kl_loss = 0.5 * torch.mean((new_log_probs - sample["log_probs"][:,_]) ** 2) / (args.gradient_accumulation_steps * len(train_timesteps))
+            kl_loss = 0.5 * torch.mean((new_log_probs - sample["log_probs"][:,t]) ** 2) / (args.gradient_accumulation_steps * len(train_timesteps))
             loss = policy_loss + args.kl_coeff * kl_loss
 
             loss.backward()
@@ -639,9 +578,6 @@ def train_one_step(
             dist.all_reduce(avg_clip_frac, op=dist.ReduceOp.AVG)
             total_clip_frac += avg_clip_frac.item()
 
-        if dist.get_rank() == 0:
-            main_print(f"##### Optimize sampling time per step: {optimize_sampling_time / (i+1)} seconds")
-
         if (i + 1) % args.gradient_accumulation_steps == 0:
             grad_norm = transformer.clip_grad_norm_(max_grad_norm)
             optimizer.step()
@@ -653,6 +589,9 @@ def train_one_step(
         #     print("advantage", sample["advantages"].item())
         #     print("final loss", loss.item())
         #     print("kl loss", kl_loss.item())
+
+        if dist.get_rank() == 0:
+            main_print(f"##### Optimize sampling time per step: {optimize_sampling_time / (i+1)} seconds")
 
         if dist.is_initialized():
             dist.barrier()
@@ -672,25 +611,13 @@ def evaluate(
     device,
     transformer,
     vae,
-    reward_models,
-    reward_weights,
+    reward_model,
     global_step,
     test_dataset,
     num_eval_samples=6
 ):
     """
     Evaluate the model on the given prompts and log on wandb
-
-    Args:
-        args
-        device
-        transformer
-        vae
-        reward_models
-        reward_weights
-        global_step
-        eval_batch
-        num_eval_samples: generation num for each prompt
     """
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -700,8 +627,13 @@ def evaluate(
         print(f"Starting evaluation at step {global_step}")
     
 
-    test_sampler = DistributedSampler(
-        test_dataset, rank=rank, num_replicas=world_size, shuffle=False, seed=args.sampler_seed
+    test_sampler = DistributedKRepeatSampler(
+        test_dataset,
+        rank=rank,
+        num_replicas=world_size,
+        shuffle=False,
+        seed=args.sampler_seed,
+        k=num_eval_samples
     )
 
     test_dataloader = DataLoader(
@@ -739,8 +671,7 @@ def evaluate(
     all_eval_results_for_logging = []
 
     # Set a max_eval_num for efficiency
-    max_eval_num = 10
-    eval_cnt = 0
+    max_eval_num = 1
 
     # Some shared variables for the evaluation
     image_ids = prepare_latent_image_ids(1, latent_h // 2, latent_w // 2, device, torch.bfloat16)
@@ -755,8 +686,6 @@ def evaluate(
             disable=(rank != 0)
         )
         for eval_batch in dataloader_progress:
-            if eval_cnt > max_eval_num:
-                break
             (
                 encoder_hidden_states_batch, 
                 pooled_prompt_embeds_batch, 
@@ -822,56 +751,47 @@ def evaluate(
 
             # Compute rewards for the entire batch
             batched_prompts = [prompt for prompt in eval_prompts for _ in range(num_eval_samples)]
-            rewards, _, rewards_dict, _ = compute_reward(
+            all_rewards, success = compute_reward(
                 decoded_images,
                 batched_prompts,
-                reward_models,
-                reward_weights
+                reward_model
             )
 
-            # --- Gather and Log Results on Rank 0 ---
-            if rank == 0:
-                # Restructure flattened rewards and images for logging
-                for prompt_idx, prompt in enumerate(eval_prompts):
-                    start_idx = prompt_idx * num_eval_samples
-                    end_idx = start_idx + num_eval_samples
-                    
-                    prompt_results_to_log = {
-                        "prompt": prompt,
-                        "images": decoded_images[start_idx:end_idx],
-                        "rewards": []
-                    }
-                    
-                    # Extract rewards for this specific prompt
-                    if args.multi_reward_mix == "reward_aggr":
-                        prompt_results_to_log["rewards"] = rewards[start_idx:end_idx]
-                    elif args.multi_reward_mix == "advantage_aggr":
-                        for model_name, model_rewards in rewards_dict.items():
-                            weighted_rewards = [
-                                model_rewards[i] * reward_weights[model_name] for i in range(start_idx, end_idx)
-                            ]
-                            if not prompt_results_to_log["rewards"]:
-                                prompt_results_to_log["rewards"] = weighted_rewards
-                            else:
-                                prompt_results_to_log["rewards"] = [
-                                    sum(x) for x in zip(prompt_results_to_log["rewards"], weighted_rewards)
-                                ]
-                    
-                    all_eval_results_for_logging.append(prompt_results_to_log)
-            
-            if rank == 0:
-                dataloader_progress.set_postfix({
-                    'prompts_processed': num_prompts_in_batch,
-                    'total_results': len(all_eval_results_for_logging)
-                })
+            # --- Gather and Log Results
+            # Restructure flattened rewards and images for logging
+            for prompt_idx, prompt in enumerate(eval_prompts):
+                start_idx = prompt_idx * num_eval_samples
+                end_idx = start_idx + num_eval_samples
+                
+                prompt_results_to_log = {
+                    "prompt": prompt,
+                    "images": decoded_images[start_idx:end_idx],
+                    "rewards": all_rewards[start_idx:end_idx]
+                }
+
+                all_eval_results_for_logging.append(prompt_results_to_log)
+        
+        if rank == 0:
+            dataloader_progress.set_postfix({
+                'prompts_processed': num_prompts_in_batch,
+                'total_results': len(all_eval_results_for_logging)
+            })
 
     # All processes wait here until evaluation is done on all of them.
     if dist.is_initialized():
         dist.barrier()
 
-    # Log on wandb - ONLY from rank 0
-    # (The logging logic remains the same as it was already efficient and only runs on a single rank)
+
+    # Log on wandb for the main process
     if rank == 0:
+
+        # Gather all all_eval_results_for_logging from all GPUs ( Realy slow, why???)
+        # gathered_eval_results = gather_objects(all_eval_results_for_logging, rank, world_size)
+
+        # gathered_eval_results = [item for sublist in gathered_eval_results for item in sublist]
+
+
+        log_start_time = time.time()
         with tempfile.TemporaryDirectory() as tmpdir:
             wandb_log_dict = {
                 "eval/prompt_details": []
@@ -887,37 +807,35 @@ def evaluate(
                 for img_idx, (img, reward) in enumerate(zip(images, rewards)):
                     if img_idx > 0: # Only one image per prompt for simplicity
                         break
-                    img_name = f"{prompt_idx}_{img_idx}.jpg"
-                    img.save(os.path.join(tmpdir, img_name), format="JPEG")
+
+                    prompt_len = len(prompt)
+                    img_name = f"{rank}_{prompt_idx}_{img_idx}.jpg"
+                    img.save(
+                        os.path.join(tmpdir, img_name),
+                        format="JPEG",
+                        quality=90,
+                        optimize=True
+                    )
                     wandb_images.append(wandb.Image(
                         os.path.join(tmpdir, img_name),
-                        caption=f"Prompt {prompt_idx}, Sample {img_idx}, Reward: {reward:.4f}"
+                        caption=f"Prompt {prompt[:min(prompt_len, 50)]}, Sample {img_idx}, Reward: {reward:.4f}"
                     ))
             
-                wandb_log_dict[f"eval_images"] = wandb_images
+                wandb_log_dict[f"eval/images"] = wandb_images
 
-                avg_reward = np.mean(rewards)
-                wandb_log_dict[f"eval/reward_per_prompt/{prompt_idx}"] = avg_reward
                 wandb_log_dict["eval/prompt_details"].append({
-                    "prompt_id": prompt_idx,
                     'prompt': prompt,
-                    "avg_reward": avg_reward
+                    "avg_reward": np.mean(all_rewards[start_idx:end_idx])
                 })
-
-            all_rewards = [reward for result in all_eval_results_for_logging for reward in result["rewards"]]
-            wandb_log_dict["eval/global_reward_mean"] = np.mean(all_rewards) if all_rewards else 0
-            wandb_log_dict["eval/global_reward_std"] = np.std(all_rewards) if all_rewards else 0
-
-            # prompt_table = wandb.Table(columns=["Prompt_ID", "Prompt_Text", "Avg_Reward"])
-            # for prompt_idx, result in enumerate(all_eval_results_for_logging):
-            #     avg_reward = np.mean(result["rewards"]) if result["rewards"] else 0
-            #     prompt_table.add_data(prompt_idx, result["prompt"], avg_reward)
             
-            # wandb_log_dict["eval/prompts_table"] = prompt_table
+
+            wandb_log_dict["eval/global_reward_mean"] = np.mean(all_rewards)
+            wandb_log_dict["eval/global_reward_std"] = np.std(all_rewards)
         
             wandb.log(wandb_log_dict, step=global_step)
-            
+            log_end_time = time.time()
             print(f"\n\nEvaluation completed. Global average reward: {np.mean(all_rewards):.4f}")
+            print(f"Time taken for logging: {log_end_time - log_start_time:.2f} seconds")
     
     if dist.is_initialized():
         dist.barrier()
@@ -956,37 +874,35 @@ def main(args):
     # as these weights are only used for inference, keeping weights in full precision is not required
     
     ############################# Build reward models #############################
-    reward_models = []
     if args.reward_model == "hpsv2":
-        reward_models.append(HPSClipRewardModel(
+        reward_model = HPSClipRewardModel(
             device=device,
             clip_ckpt_path=args.hps_clip_path,
             hps_ckpt_path=args.hps_path,
-        ))
+        )
     elif args.reward_model == "image_reward":
-        reward_models.append(ImageRewardModel(
+        reward_model = ImageRewardModel(
             model_name=args.image_reward_path,
             device=device,
             med_config=args.image_reward_med_config,
             http_proxy=args.image_reward_http_proxy,
             https_proxy=args.image_reward_https_proxy,
-        ))
-
+        )
     elif args.reward_model == "clip_score":
-        reward_models.append(CLIPScoreRewardModel(
+        reward_model = CLIPScoreRewardModel(
             clip_model_path=args.clip_score_path,
             device=device,
-        ))
+        )
     elif args.reward_model == "pick_score":
-        reward_models.append(PickScoreRewardModel(
+        reward_model = PickScoreRewardModel(
             device=device,
             http_proxy=args.pick_score_http_proxy,
             https_proxy=args.pick_score_https_proxy,
-        ))
+        )
     elif args.reward_model == "ocr_score":
-        reward_models.append(OcrRewardModel(
+        reward_model = OcrRewardModel(
             device_id=device
-        ))
+        )
     elif args.reward_model == "unified_reward":
         unified_reward_urls = args.unified_reward_url.split(",")
         
@@ -995,85 +911,14 @@ def main(args):
             ur_url_idx = rank % num_urls
             ur_url = unified_reward_urls[ur_url_idx]
             print(f"Rank {rank} using unified-reward URL: {ur_url}")
-        reward_models.append(UnifiedRewardModel(
+        reward_model = UnifiedRewardModel(
             api_url=ur_url,
             default_question_type=args.unified_reward_default_question_type,
             num_workers=args.unified_reward_num_workers,
-        ))
-    
-    elif args.reward_model == "hpsv2_clip_score":
-        reward_models.append(HPSClipRewardModel(
-            device=device,
-            clip_ckpt_path=args.hps_clip_path,
-            hps_ckpt_path=args.hps_path,
-        ))
-        reward_models.append(CLIPScoreRewardModel(
-            clip_model_path=args.clip_score_path,
-            device=device,
-        ))
-    elif args.reward_model == "multi_reward":
-        reward_models.append(HPSClipRewardModel(
-            device=device,
-            clip_ckpt_path=args.hps_clip_path,
-            hps_ckpt_path=args.hps_path,
-        ))
-        reward_models.append(ImageRewardModel(
-            model_name=args.image_reward_path,
-            device=device,
-            med_config=args.image_reward_med_config,
-            http_proxy=args.image_reward_http_proxy,
-            https_proxy=args.image_reward_https_proxy,
-        ))
-        reward_models.append(PickScoreRewardModel(
-            device=device,
-            http_proxy=args.pick_score_http_proxy,
-            https_proxy=args.pick_score_https_proxy,
-        ))
-        if args.unified_reward_url is not None:
-            unified_reward_urls = args.unified_reward_url.split(",")
-            if isinstance(unified_reward_urls, list):
-                num_urls = len(unified_reward_urls)
-                ur_url_idx = rank % num_urls
-                ur_url = unified_reward_urls[ur_url_idx]
-                print(f"Rank {rank} using unified-reward URL: {ur_url}")
-            reward_models.append(UnifiedRewardModel(
-                api_url=ur_url,
-                default_question_type=args.unified_reward_default_question_type,
-                num_workers=args.unified_reward_num_workers,
-            ))
+        )
     else:
         raise ValueError(f"Unsupported reward model: {args.reward_model}")
 
-
-    ############################# Reward Models Setting #############################
-        
-    # Initialize reward model weights only for activated models
-    reward_weights = {}
-    for model in reward_models:
-        model_name = type(model).__name__    
-        if model_name == 'HPSClipRewardModel':
-            weight = args.hps_weight
-        elif model_name == 'CLIPScoreRewardModel':
-            weight = args.clip_score_weight
-        elif model_name == 'ImageRewardModel':
-            weight = args.image_reward_weight
-        elif model_name == 'UnifiedRewardModel':
-            weight = args.unified_reward_weight
-        elif model_name == 'PickScoreRewardModel':
-            weight = args.pick_score_weight
-        else:
-            weight = 1.0
-        reward_weights[model_name] = weight
-
-    # Normalize weights
-    total_weight = sum(reward_weights.values())
-    if total_weight > 0:
-        reward_weights = {k: v/total_weight for k, v in reward_weights.items()}
-    else:
-        main_print("No reward models activated or all weights are 0!")
-        reward_weights = {type(model).__name__: 1.0/len(reward_models) for model in reward_models}
-
-    main_print(f"reward_weights: {reward_weights}")
 
     ############################# Build FLUX #############################
     main_print(f"--> loading model from {args.pretrained_model_name_or_path}")
@@ -1093,14 +938,13 @@ def main(args):
         args.master_weight_type,
     )
     
-    transformer = FSDP(transformer, **fsdp_kwargs,)
+    transformer = FSDP(transformer, **fsdp_kwargs)
 
     if args.gradient_checkpointing:
         apply_fsdp_checkpointing(
             transformer, no_split_modules, args.selective_checkpointing
         )
     
-
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
@@ -1143,9 +987,14 @@ def main(args):
     )
 
     train_dataset = LatentDataset(args.data_json_path, args.num_latent_t, args.cfg)
-    sampler = DistributedSampler(
-            train_dataset, rank=rank, num_replicas=world_size, shuffle=True, seed=args.sampler_seed
-        )
+    sampler = DistributedKRepeatSampler(
+            train_dataset,
+            rank=rank,
+            num_replicas=world_size,
+            shuffle=True,
+            seed=args.sampler_seed,
+            k=args.num_generations
+    )
 
     test_dataset = LatentDataset(args.test_data_json_path, args.num_latent_t, args.cfg)
 
@@ -1170,6 +1019,10 @@ def main(args):
             id=run_id,
         )
 
+    # wait for wandb init
+    if dist.is_initialized():
+        dist.barrier()
+
     # Train!
     total_batch_size = (
         args.train_batch_size
@@ -1180,7 +1033,6 @@ def main(args):
     )
     main_print("***** Running training *****")
     main_print(f"  Num examples = {len(train_dataset)}")
-    main_print(f"  Dataloader size = {len(train_dataloader)}")
     main_print(f"  Resume training from step {init_steps}")
     main_print(f"  Instantaneous batch size per device = {args.train_batch_size}")
     main_print(
@@ -1248,8 +1100,7 @@ def main(args):
                     device,
                     transformer,
                     vae,
-                    reward_models,
-                    reward_weights,
+                    reward_model,
                     global_step,
                     test_dataset,
                     num_eval_samples=args.num_eval_samples
@@ -1285,15 +1136,14 @@ def main(args):
                 device, 
                 transformer,
                 vae,
-                reward_models,
+                reward_model,
                 optimizer,
                 lr_scheduler,
                 loader,
                 noise_scheduler,
                 args.max_grad_norm,
                 timesteps_train,
-                global_step,
-                reward_weights,
+                global_step
             )
     
             step_time = time.time() - start_time

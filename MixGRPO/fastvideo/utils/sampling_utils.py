@@ -62,9 +62,8 @@ def run_sample_step(
         B = encoder_hidden_states.shape[0]
         sigma = sigma_schedule[i]
         timestep_value = int(sigma * 1000)
-        timesteps = torch.full([encoder_hidden_states.shape[0]], timestep_value, device=z.device, dtype=torch.long)
+        timesteps = torch.full([B], timestep_value, device=z.device, dtype=torch.long)
         transformer.eval()
-
         with torch.autocast("cuda", torch.bfloat16):
             pred=transformer(
                 hidden_states=z,

@@ -42,10 +42,12 @@ def _compute_single_reward(reward_model, images, input_prompts):
     except Exception as e:
         raise ValueError(f"Error in _compute_single_reward with {reward_model_name}: {e}") from e
 
-def compute_reward(images, input_prompts, reward_models, reward_weights):
+def compute_reward(images, input_prompts, reward_model):
         assert (
             len(images) == len(input_prompts)
         ), f"length of `images` ({len(images)}) must be equal to length of `input_prompts` ({len(input_prompts)})"
+
+        return _compute_single_reward(reward_model, images, input_prompts)
         
         # Initialize results
         rewards_dict = {}
