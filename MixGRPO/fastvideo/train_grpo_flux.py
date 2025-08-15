@@ -672,11 +672,6 @@ def evaluate(
                     ))
             
                 wandb_log_dict[f"eval/images"] = wandb_images
-
-                wandb_log_dict["eval/prompt_details"].append({
-                    'prompt': prompt,
-                    "avg_reward": np.mean(all_rewards[start_idx:end_idx])
-                })
             
 
             wandb_log_dict["eval/global_reward_mean"] = np.mean(all_rewards)
