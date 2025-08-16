@@ -871,6 +871,7 @@ def main(args):
             subfolder="vae",
             torch_dtype = torch.bfloat16,
         ).to(device)
+        vae.requires_grad_(False)
     
     transformer = FSDP(transformer, **fsdp_kwargs)
 

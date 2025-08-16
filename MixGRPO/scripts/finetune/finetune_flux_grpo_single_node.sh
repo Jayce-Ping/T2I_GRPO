@@ -81,8 +81,8 @@ t=1
 train_batch_size=1
 test_batch_size=8
 num_generations=8
-max_eval_num=16
-num_eval_samples=3
+max_eval_num=10
+num_eval_samples=8
 
 # Lora Config
 lora_rank=32
@@ -123,7 +123,7 @@ echo "Starting single node training with $nproc_per_node processes"
 
 # Set environment variables
 ### Wandb
-export WANDB_DISABLED=true
+export WANDB_DISABLED=false
 export WANDB_BASE_URL="https://api.wandb.ai"
 export WANDB_MODE=online
 export WANDB_PROJECT="MixGRPO"
@@ -141,6 +141,7 @@ echo "free_port=$free_port"
 # Run single node training with torchrun
 torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_port \
     fastvideo/train_grpo_flux.py \
+    --enable_eval \
     --seed $seed \
     --pretrained_model_name_or_path $model_path \
     --vae_model_path $model_path \
