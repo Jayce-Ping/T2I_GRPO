@@ -18,7 +18,7 @@ import flow_grpo.prompts
 import flow_grpo.rewards
 from flow_grpo.stat_tracking import PerPromptStatTracker
 from flow_grpo.diffusers_patch.sd3_pipeline_with_logprob import pipeline_with_logprob
-from flow_grpo.diffusers_patch.sd3_sde_with_logprob import sde_step_with_logprob
+from flow_grpo.diffusers_patch.sd3_sde_with_logprob import denoising_step_with_logprob
 from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import encode_prompt
 import torch
 import wandb

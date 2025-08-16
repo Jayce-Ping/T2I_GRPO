@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Union, Callable
 import torch
 import numpy as np
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import retrieve_timesteps
-from .sd3_sde_with_logprob import sde_step_with_logprob
+from .sd3_sde_with_logprob import denoising_step_with_logprob
 
 def calculate_shift(
     image_seq_len,
@@ -161,12 +161,14 @@ def pipeline_with_logprob(
             )[0]
             noise_pred = noise_pred.to(prompt_embeds.dtype)
             latents_dtype = latents.dtype
-            latents, log_prob, prev_latents_mean, std_dev_t = sde_step_with_logprob(
-                self.scheduler, 
-                noise_pred.float(), 
-                t.unsqueeze(0).repeat(latents.shape[0]), 
+            latents, log_prob, prev_latents_mean, std_dev_t = denoising_step_with_logprob(
+                self.scheduler,
+                noise_pred.float(),
+                t.unsqueeze(0).repeat(latents.shape[0]),
                 latents.float(),
                 noise_level=noise_level,
+                prev_sample=None,
+                generator=generator # Added by BowenPing, there is no such generator assignment in the original code.
             )
             if latents.dtype != latents_dtype:
                 latents = latents.to(latents_dtype)

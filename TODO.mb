@@ -12,3 +12,20 @@
 - Figure out how data are loaded
 
 - Use single reward model in the traning code. DO NOT USE linear reward_weights dict ✅
+
+
+
+# 8.16
+
+- Give up on modifying MixGRPO and DanceGRPO code, because of the confict between FSDP and Lora.
+
+- Turning on Flow_GRPO code and add MixGRPO windows sliding scheduler.
+
+
+> MixGRPO defines an interval S = [t1, t2), which is a subinterval of the denoising time range [0, T ], so 0 ≤ t1 ≤ t2 ≤ T . During the denoising process, we use SDE sampling within the interval S and ODE sampling outside, while the interval S moves from 0 to T throughout the training process (See Figure 2).
+
+- Add the above algorithm. Determinism for sampling.
+
+> Along the discrete denosing timesteps {0, 1, . . . , T −1}, MixGRPO defines a sliding window W (l) and optimization is only employed at the timesteps within this window.
+
+- Add scheduler for the above algorithm.

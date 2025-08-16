@@ -10,9 +10,7 @@ import time
 import torch
 import tqdm
 import wandb
-
-import flow_grpo.prompts
-import flow_grpo.rewards
+from argparse import Namespace
 
 from absl import app, flags
 from accelerate import Accelerator
@@ -22,60 +20,28 @@ from collections import defaultdict
 from concurrent import futures
 from diffusers import FluxPipeline
 from diffusers.utils.torch_utils import is_compiled_module
-from flow_grpo.diffusers_patch.flux_pipeline_with_logprob import pipeline_with_logprob
-from flow_grpo.diffusers_patch.sd3_sde_with_logprob import sde_step_with_logprob
-from flow_grpo.diffusers_patch.train_dreambooth_lora_flux import encode_prompt
-from flow_grpo.ema import EMAModuleWrapper
-from flow_grpo.stat_tracking import PerPromptStatTracker
 from functools import partial
 from ml_collections import config_flags
 from peft import LoraConfig, get_peft_model, set_peft_model_state_dict, PeftModel
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, Sampler
 
+import flow_grpo.prompts
+import flow_grpo.rewards.rewards
+from flow_grpo.diffusers_patch.flux_pipeline_with_logprob import pipeline_with_logprob
+from flow_grpo.diffusers_patch.sd3_sde_with_logprob import denoising_step_with_logprob
+from flow_grpo.diffusers_patch.train_dreambooth_lora_flux import encode_prompt
+from flow_grpo.ema import EMAModuleWrapper
+from flow_grpo.stat_tracking import PerPromptStatTracker
+from flow_grpo.datasets.prompt_dataset import TextPromptDataset, GenevalPromptDataset
+from flow_grpo.scheduler import FlowMatchSlidingWindowScheduler
+
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
 FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", "config/base.py", "Training configuration.")
-
+    
 logger = get_logger(__name__)
-
-class TextPromptDataset(Dataset):
-    def __init__(self, dataset, split='train'):
-        self.file_path = os.path.join(dataset, f'{split}.txt')
-        with open(self.file_path, 'r') as f:
-            self.prompts = [line.strip() for line in f.readlines()]
-        
-    def __len__(self):
-        return len(self.prompts)
-    
-    def __getitem__(self, idx):
-        return {"prompt": self.prompts[idx], "metadata": {}}
-
-    @staticmethod
-    def collate_fn(examples):
-        prompts = [example["prompt"] for example in examples]
-        metadatas = [example["metadata"] for example in examples]
-        return prompts, metadatas
-
-class GenevalPromptDataset(Dataset):
-    def __init__(self, dataset, split='train'):
-        self.file_path = os.path.join(dataset, f'{split}_metadata.jsonl')
-        with open(self.file_path, 'r', encoding='utf-8') as f:
-            self.metadatas = [json.loads(line) for line in f]
-            self.prompts = [item['prompt'] for item in self.metadatas]
-        
-    def __len__(self):
-        return len(self.prompts)
-    
-    def __getitem__(self, idx):
-        return {"prompt": self.prompts[idx], "metadata": self.metadatas[idx]}
-
-    @staticmethod
-    def collate_fn(examples):
-        prompts = [example["prompt"] for example in examples]
-        metadatas = [example["metadata"] for example in examples]
-        return prompts, metadatas
 
 class DistributedKRepeatSampler(Sampler):
     def __init__(self, dataset, batch_size, k, num_replicas, rank, seed=0):
@@ -202,13 +168,14 @@ def compute_log_prob(transformer, pipeline, sample, j, config):
         return_dict=False,
     )[0]
     # compute the log prob of next_latents given latents under the current model
-    prev_sample, log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
+    # Here, use determistic denoising for normal diffusion process.
+    prev_sample, log_prob, prev_sample_mean, std_dev_t = denoising_step_with_logprob(
         pipeline.scheduler,
         model_pred.float(),
         sample["timesteps"][:, j],
         sample["latents"][:, j].float(),
-        prev_sample=sample["next_latents"][:, j].float(),
         noise_level=config.sample.noise_level,
+        prev_sample=sample["next_latents"][:, j].float(),
     )
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
@@ -320,54 +287,25 @@ def save_ckpt(save_dir, transformer, global_step, accelerator, ema, transformer_
         if config.train.ema:
             ema.copy_temp_to(transformer_trainable_parameters)
 
-def main(_):
-    # basic Accelerate and logging setup
-    config = FLAGS.config
 
-    unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
-    if not config.run_name:
-        config.run_name = unique_id
-    else:
-        config.run_name += "_" + unique_id
 
-    # number of timesteps within each trajectory to train on
-    num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
-
-    accelerator_config = ProjectConfiguration(
-        project_dir=os.path.join(config.logdir, config.run_name),
-        automatic_checkpoint_naming=True,
-        total_limit=config.num_checkpoint_limit,
-    )
-
-    accelerator = Accelerator(
-        # log_with="wandb",
-        mixed_precision=config.mixed_precision,
-        project_config=accelerator_config,
-        # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
-        # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
-        # the total number of optimizer steps to accumulate across.
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps * num_train_timesteps,
-    )
-    if accelerator.is_main_process:
-        wandb.init(
-            project="flow_grpo",
-            # mode="disabled"
-        )
-        # accelerator.init_trackers(
-        #     project_name="flow-grpo",
-        #     config=config.to_dict(),
-        #     init_kwargs={"wandb": {"name": config.run_name}},
-        # )
-    logger.info(f"\n{config}")
-
-    # set seed (device_specific is very important to get different prompts on different devices)
-    set_seed(config.seed, device_specific=True)
-
+def load_pipeline(config : Namespace, accelerator : Accelerator):
+    # -------------------------------Load models-----------------------------------
     # load scheduler, tokenizer and models.
     pipeline = FluxPipeline.from_pretrained(
         config.pretrained.model,
         low_cpu_mem_usage=False
     )
+
+    scheduler = FlowMatchSlidingWindowScheduler(
+        window_size=config.sample.window_size,
+        num_train_timesteps=config.sample.num_steps,
+        **pipeline.scheduler.config.__dict__,
+    )
+
+    # Overwrite the original scheduler
+    pipeline.scheduler = scheduler
+
     # freeze parameters of models to save more memory
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
@@ -431,9 +369,59 @@ def main(_):
             pipeline.transformer.set_adapter("default")
         else:
             pipeline.transformer = get_peft_model(pipeline.transformer, transformer_lora_config)
-    
+
+
+    return pipeline, text_encoders, tokenizers
+
+def main(_):
+    # basic Accelerate and logging setup
+    config = FLAGS.config
+
+    unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
+    if not config.run_name:
+        config.run_name = unique_id
+    else:
+        config.run_name += "_" + unique_id
+
+    # TODO, modify here to add mixgrpo
+    # number of timesteps within each trajectory to train on
+    # num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction) # Original code
+    num_train_timesteps = config.sample.window_size # TODO, add window_size parameter in the config
+
+    accelerator_config = ProjectConfiguration(
+        project_dir=os.path.join(config.logdir, config.run_name),
+        automatic_checkpoint_naming=True,
+        total_limit=config.num_checkpoint_limit,
+    )
+
+    accelerator = Accelerator(
+        # log_with="wandb",
+        mixed_precision=config.mixed_precision,
+        project_config=accelerator_config,
+        # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
+        # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
+        # the total number of optimizer steps to accumulate across.
+        gradient_accumulation_steps=config.train.gradient_accumulation_steps * num_train_timesteps,
+    )
+    if accelerator.is_main_process:
+        wandb.init(
+            project="FlowGRPO",
+            # mode="disabled"
+        )
+        # accelerator.init_trackers(
+        #     project_name="flow-grpo",
+        #     config=config.to_dict(),
+        #     init_kwargs={"wandb": {"name": config.run_name}},
+        # )
+    logger.info(f"\n{config}")
+
+    # set seed (device_specific is very important to get different prompts on different devices)
+    set_seed(config.seed, device_specific=True)
+    # --------------------------------------Load pipeline----------------------------------
+    pipeline, text_encoders, tokenizers = load_pipeline(config, accelerator)
     transformer = pipeline.transformer
     transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
+
     # This ema setting affects the previous 20 × 8 = 160 steps on average.
     ema = EMAModuleWrapper(transformer_trainable_parameters, decay=0.9, update_step_interval=8, device=accelerator.device)
     
@@ -463,9 +451,10 @@ def main(_):
         eps=config.train.adam_epsilon,
     )
 
+    # ---------------------------------------Reward---------------------------------------
     # prepare prompt and reward fn
-    reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
-    eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
+    reward_fn = getattr(flow_grpo.rewards.rewards, 'multi_score')(accelerator.device, config.reward_fn)
+    eval_reward_fn = getattr(flow_grpo.rewards.rewards, 'multi_score')(accelerator.device, config.reward_fn)
 
     if config.prompt_fn == "general_ocr":
         train_dataset = TextPromptDataset(config.dataset, 'train')
@@ -529,14 +518,14 @@ def main(_):
     else:
         raise NotImplementedError("Only general_ocr is supported with dataset")
 
+
     if config.sample.num_image_per_prompt == 1:
         config.per_prompt_stat_tracking = False
-    # initialize stat tracker
+    # Initialize stat tracker
     if config.per_prompt_stat_tracking:
         stat_tracker = PerPromptStatTracker(config.sample.global_std)
 
-    # for some reason, autocast is necessary for non-lora training but for lora training it isn't necessary and it uses
-    # more memory
+    # For some reason, autocast is necessary for non-lora training but for lora training it isn't necessary and it uses more memory
     autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
     # autocast = accelerator.autocast
 
@@ -549,7 +538,7 @@ def main(_):
     # remote server running llava inference.
     executor = futures.ThreadPoolExecutor(max_workers=8)
 
-    # Train!
+    # ------------------------------------------- Train!------------------------------------------
     samples_per_epoch = (
         config.sample.train_batch_size
         * accelerator.num_processes
@@ -609,7 +598,7 @@ def main(_):
                 prompts, 
                 text_encoders, 
                 tokenizers, 
-                max_sequence_length=128, 
+                max_sequence_length=128,
                 device=accelerator.device
             )
             prompt_ids = tokenizers[0](
@@ -631,7 +620,8 @@ def main(_):
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
-                        num_inference_steps=config.sample.num_steps,
+                        # num_inference_steps=config.sample.num_steps, # Original code
+                        sigmas=pipeline.scheduler.get_window_sigmas(),
                         guidance_scale=config.sample.guidance_scale,
                         output_type="pt",
                         height=config.resolution,
@@ -659,12 +649,8 @@ def main(_):
                     "pooled_prompt_embeds": pooled_prompt_embeds,
                     "image_ids": image_ids.unsqueeze(0).repeat(len(prompt_ids),1,1),
                     "timesteps": timesteps,
-                    "latents": latents[
-                        :, :-1
-                    ],  # each entry is the latent before timestep t
-                    "next_latents": latents[
-                        :, 1:
-                    ],  # each entry is the latent after timestep t
+                    "latents": latents[:, :-1],  # each entry is the latent before timestep t
+                    "next_latents": latents[:, 1:],  # each entry is the latent after timestep t
                     "log_probs": log_probs,
                     "rewards": rewards,
                 }
@@ -826,6 +812,7 @@ def main(_):
                             if config.train.beta > 0:
                                 with torch.no_grad():
                                     with transformer.module.disable_adapter():
+                                        # Disable adapter to get the original reference model parameters.
                                         _, _, prev_sample_mean_ref, _ = compute_log_prob(transformer, pipeline, sample, j, config)
 
                         # grpo logic

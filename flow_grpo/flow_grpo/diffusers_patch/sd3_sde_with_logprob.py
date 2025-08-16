@@ -8,14 +8,14 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
-def sde_step_with_logprob(
+def denoising_step_with_logprob(
     self: FlowMatchEulerDiscreteScheduler,
     model_output: torch.FloatTensor,
     timestep: Union[float, torch.FloatTensor],
     sample: torch.FloatTensor,
     noise_level: float = 0.7,
     prev_sample: Optional[torch.FloatTensor] = None,
-    generator: Optional[torch.Generator] = None,
+    generator: Optional[torch.Generator] = None
 ):
     """
     Predict the sample from the previous timestep by **reversing** the SDE. This function propagates the flow
@@ -28,8 +28,12 @@ def sde_step_with_logprob(
             The current discrete timestep in the diffusion chain.
         sample (`torch.FloatTensor`):
             A current instance of a sample created by the diffusion process.
+        noise_level (`float`):
+            The noise level parameter
+        prev_sample (`torch.FloatTensor`):
+            The next insance of the sample. If given, returns the log_probs between predicted prev_sample and given prev_sample, with no grad.
         generator (`torch.Generator`, *optional*):
-            A random number generator.
+            A random number generator for SDE solving. If not given, use determistic denoising step (no noise added).
     """
     # bf16 can overflow here when compute prev_sample_mean, we must convert all variable to fp32
     model_output=model_output.float()
@@ -58,7 +62,12 @@ def sde_step_with_logprob(
 
     prev_sample_mean = sample * (1 + std_dev_t**2 / (2 * sigma) * dt) + model_output * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt
     
-    if prev_sample is None:
+    if generator is None:
+        # Determistic step - normal diffusion process
+        prev_sample = sample + dt * model_output
+    else:
+        # Non-determistic step, add noise to it
+        assert prev_sample is None, ValueError("For non-determistic denoising step (for GRPO sampling), prev_sample cannot be provided.")
         variance_noise = randn_tensor(
             model_output.shape,
             generator=generator,
