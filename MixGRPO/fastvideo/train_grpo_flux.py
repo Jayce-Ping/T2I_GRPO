@@ -41,6 +41,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
+from peft import LoraConfig, get_peft_model
 
 from fastvideo.dataset.latent_flux_rl_datasets import LatentDataset, latent_collate_function
 from fastvideo.reward.reward_model import RewardModel
@@ -683,38 +684,31 @@ def print_peak_mem_usage():
     peak_mem = torch.cuda.max_memory_allocated()
     print(f"Peak memory usage: {peak_mem / 1024**3:.2f} GB")
 
-def main(args):
-    ############################# Init #############################
-    torch.backends.cuda.matmul.allow_tf32 = True
-
-    local_rank = int(os.environ["LOCAL_RANK"])
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-
+def setup_distributed(args : Namespace) -> Tuple[int, int, int, int]:
+    """
+        Setup distributed training environment.
+    """
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    
+    # 初始化进程组
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size
+    )
+    
     torch.cuda.set_device(local_rank)
+
     device = torch.cuda.current_device()
 
-    dist.init_process_group(backend="nccl")
+    return rank, local_rank, world_size, device
 
-    initialize_sequence_parallel_state(args.sp_size)
-
-    # If passed along, set the training seed now. On GPU...
-    if args.seed is not None:
-        # TODO: t within the same seq parallel group should be the same. Noise should be different.
-        set_seed(args.seed + rank)
-    # We use different seeds for the noise generation in each process to ensure that the noise is different in a batch.
-
-    # Handle the repository creation
-    if rank <= 0 and args.output_dir is not None:
-        os.makedirs(args.output_dir, exist_ok=True)
-        os.makedirs(f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}", exist_ok=True)
-        args_dict = vars(args)
-        run_id = wandb.util.generate_id()
-        args_dict["wandb_id"] = run_id
-        with open(f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}/args.json", "w") as f:
-            json.dump(args_dict, f, indent=4)
-    # For mixed precision training we cast all non-trainable weigths to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required
+def load_reward_model(args : Namespace, rank : int, device : int) -> RewardModel:
+    """
+        Load the rewardmodel
+    """
     ############################# Build reward models #############################
     if args.reward_model == "hpsv2":
         from fastvideo.reward.hps_score import HPSClipRewardModel
@@ -767,41 +761,121 @@ def main(args):
     else:
         raise ValueError(f"Unsupported reward model: {args.reward_model}")
 
+    return reward_model
+
+def load_model_with_lora(args, model_name_path : str, local_rank: int):
+    """
+        Load model with FSDP and apply LoRA
+    """
+    print(f"Loading Flux.1-Dev model with FSDP on GPU {local_rank}...")
+    
+    # Load model
+    with torch.device("cpu"):
+        pipeline = FluxPipeline.from_pretrained(
+            model_name_path,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True
+        )
+        
+        transformer = pipeline.transformer
+
+        # Apply LoRA
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=args.lora_target_modules,
+            bias="none"
+        )
+        
+        transformer = get_peft_model(transformer, lora_config)
+
+    # Print parameter information
+    trainable_params = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in transformer.parameters())
+    
+    if local_rank == 0:
+        print(f"Trainable parameters: {trainable_params /  (1024**3):,} GB")
+        print(f"Total parameters: {total_params / (1024**3):,} GB")
+        print(f"Trainable ratio: {trainable_params/total_params:.2%}")
+    
+    return pipeline, transformer
+
+def main(args):
+    ############################# Init #############################
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    local_rank, rank, world_size, device = setup_distributed(args)
+
+    initialize_sequence_parallel_state(args.sp_size)
+
+    if args.seed is not None:
+        set_seed(args.seed + rank)
+
+    # Handle the repository creation
+    if rank <= 0 and args.output_dir is not None:
+        os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}", exist_ok=True)
+        args_dict = vars(args)
+        run_id = wandb.util.generate_id()
+        args_dict["wandb_id"] = run_id
+        with open(f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}/args.json", "w") as f:
+            json.dump(args_dict, f, indent=4)
+
+
+    reward_model = load_reward_model(args, rank, device)
 
     ############################# Build FLUX #############################
     main_print(f"--> loading model from {args.pretrained_model_name_or_path}")
     # keep the master weight to float32
+    if args.use_lora:
+        # Still bug here
+        pipeline, transformer = load_model_with_lora(args, args.pretrained_model_name_or_path, local_rank=local_rank)
+        # freeze parameters of models to save more memory
+        pipeline.vae.requires_grad_(False)
+        pipeline.text_encoder.requires_grad_(False)
+        pipeline.text_encoder_2.requires_grad_(False)
+        pipeline.transformer.requires_grad_(not args.use_lora)
+
+        # Move non-trainable modules to bfloat16
+        vae = pipeline.vae.to(device=device, dtype=torch.bfloat16)
+        pipeline.text_encoder.to(device=device, dtype=torch.bfloat16)
+        pipeline.text_encoder_2.to(device=device, dtype=torch.bfloat16)
+        transformer.to(device=device, dtype=torch.float32)
 
 
-    transformer = FluxTransformer2DModel.from_pretrained(
+        fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
+            transformer.get_base_model(),
+            args.fsdp_sharding_startegy,
+            args.use_lora,
+            args.use_cpu_offload,
+            args.master_weight_type,
+        )
+    else:
+        transformer = FluxTransformer2DModel.from_pretrained(
             args.pretrained_model_name_or_path,
             subfolder="transformer",
             torch_dtype = torch.float32
-    )
+        )
 
+        fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
+            transformer,
+            args.fsdp_sharding_startegy,
+            False,
+            args.use_cpu_offload,
+            args.master_weight_type,
+        )
 
-    vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="vae",
-        torch_dtype = torch.bfloat16,
-    ).to(device)
-
-
-    fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
-        transformer,
-        args.fsdp_sharding_startegy,
-        args.use_lora,
-        args.use_cpu_offload,
-        args.master_weight_type,
-    )
+        vae = AutoencoderKL.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="vae",
+            torch_dtype = torch.bfloat16,
+        ).to(device)
     
     transformer = FSDP(transformer, **fsdp_kwargs)
 
     if args.gradient_checkpointing:
-        apply_fsdp_checkpointing(
-            transformer, no_split_modules, args.selective_checkpointing
-        )
-        # transformer.gradient_checkpointing_enable() # New added, need test
+        apply_fsdp_checkpointing(transformer, no_split_modules, args.selective_checkpointing)
 
 
     main_print(
@@ -813,26 +887,10 @@ def main(args):
     # Set model as trainable.
     transformer.train()
 
+    #-----------------------------Optimizer------------------------
     params_to_optimize = transformer.parameters()
     params_to_optimize = list(filter(lambda p: p.requires_grad, params_to_optimize))
 
-    if args.use_lora:
-        # Still not working, TODO
-        from peft import LoraConfig, get_peft_model
-        
-        lora_config = LoraConfig(
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            target_modules=args.lora_target_modules,
-            lora_dropout=args.lora_dropout
-        )
-        transformer = get_peft_model(transformer, lora_config)
-        
-        main_print(f"LoRA enabled with rank {args.lora_rank}")
-        main_print(f"Trainable parameters: {sum(p.numel() for p in transformer.parameters() if p.requires_grad):,}")
-        main_print(f"Total parameters: {sum(p.numel() for p in transformer.parameters()):,}")
-
-    #-----------------------------Optimizer------------------------
     optimizer = torch.optim.AdamW(
         params_to_optimize,
         lr=args.learning_rate,
@@ -998,17 +1056,7 @@ def main(args):
                 if not args.use_lora:
                     save_checkpoint(transformer, rank, checkpoint_saving_dir, step, epoch)
                 else:
-                    temp_pipeline = FluxPipeline.from_pretrained(
-                        args.pretrained_model_name_or_path,
-                        transformer=None,
-                        text_encoder=None,
-                        text_encoder_2=None,
-                        torch_dtype=torch.bfloat16,
-                    )
-                    temp_pipeline.transformer = None
-                    temp_pipeline.text_encoder = None
-                    temp_pipeline.text_encoder_2 = None
-                    save_lora_checkpoint(transformer, optimizer, rank, checkpoint_saving_dir, step, temp_pipeline, epoch)
+                    save_lora_checkpoint(transformer, optimizer, rank, checkpoint_saving_dir, step, pipeline, epoch)
 
             if dist.is_initialized():
                 dist.barrier()

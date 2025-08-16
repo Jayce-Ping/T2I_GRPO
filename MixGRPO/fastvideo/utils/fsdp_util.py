@@ -66,6 +66,7 @@ def get_mixed_precision(master_weight_type="fp32"):
     return mixed_precision
 
 
+
 def get_dit_fsdp_kwargs(
     transformer,
     sharding_strategy,
@@ -74,13 +75,13 @@ def get_dit_fsdp_kwargs(
     master_weight_type="fp32",
 ):
     no_split_modules = get_no_split_modules(transformer)
-    if use_lora:
-        auto_wrap_policy = fsdp_auto_wrap_policy
-    else:
-        auto_wrap_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls=no_split_modules,
-        )
+    # if use_lora:
+    #     auto_wrap_policy = transformer_auto_wrap_policy
+    # else:
+    auto_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls=no_split_modules,
+    )
 
     # we use float32 for fsdp but autocast during training
     mixed_precision = get_mixed_precision(master_weight_type)
@@ -110,7 +111,7 @@ def get_dit_fsdp_kwargs(
     # Add LoRA-specific settings when LoRA is enabled
     if use_lora:
         fsdp_kwargs.update({
-            "use_orig_params": False,  # Required for LoRA memory savings
+            "use_orig_params": True,  # False is Required for LoRA memory savings, but confict with fsdp?
             "sync_module_states": True,
         })
 

@@ -77,15 +77,17 @@ gradient_accumulation_steps=4
 h=1024
 w=1024
 t=1
-# Ceilling config:
-#   OCR: train_batch_size=4, num_generation=8
-
 # Big Memory Influencers
-train_batch_size=2
-test_batch_size=16
+train_batch_size=1
+test_batch_size=8
 num_generations=8
 max_eval_num=16
-num_eval_samples=4
+num_eval_samples=3
+
+# Lora Config
+lora_rank=32
+lora_alpha=64
+lora_dropout=0.05
 
 # DanceGRPO Sampling Parameters
 timestep_fraction=0.6
@@ -121,7 +123,7 @@ echo "Starting single node training with $nproc_per_node processes"
 
 # Set environment variables
 ### Wandb
-export WANDB_DISABLED=false
+export WANDB_DISABLED=true
 export WANDB_BASE_URL="https://api.wandb.ai"
 export WANDB_MODE=online
 export WANDB_PROJECT="MixGRPO"
@@ -139,11 +141,11 @@ echo "free_port=$free_port"
 # Run single node training with torchrun
 torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_port \
     fastvideo/train_grpo_flux.py \
-    --enable_eval \
     --seed $seed \
     --pretrained_model_name_or_path $model_path \
     --vae_model_path $model_path \
     --cache_dir data/.cache \
+    --use_cpu_offload \
     --data_json_path $data_json_path \
     --test_data_json_path $test_data_json_path \
     --gradient_checkpointing \
@@ -183,6 +185,9 @@ torchrun --nnodes $nnodes --nproc_per_node $nproc_per_node --master_port $free_p
     --clip_range 1e-4 \
     --adv_clip_max 5.0 \
     --training_strategy $training_strategy \
+    --lora_rank $lora_rank \
+    --lora_alpha $lora_alpha \
+    --lora_dropout $lora_dropout \
     --experiment_name $experiment_name \
     --kl_coeff $kl_coeff \
     --iters_per_group $iters_per_group \
