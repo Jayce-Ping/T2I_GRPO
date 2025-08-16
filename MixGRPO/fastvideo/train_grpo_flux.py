@@ -1047,7 +1047,7 @@ def main(args):
                 os.makedirs(checkpoint_saving_dir, exist_ok=True)
                 existing_checkpoints = [
                     checkpoint_dir for checkpoint_dir in os.listdir(checkpoint_saving_dir)
-                    if os.path.isdir(checkpoint_dir) and 'checkpoint' in checkpoint_dir
+                    if os.path.isdir(os.path.join(checkpoint_saving_dir, checkpoint_dir)) and 'checkpoint' in checkpoint_dir
                 ]
                 if len(existing_checkpoints) >= 2:
                     # Remove the oldest checkpoint directory by (epoch, step)
