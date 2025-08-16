@@ -1050,9 +1050,10 @@ def main(args):
                     if os.path.isdir(checkpoint_dir) and 'checkpoint' in checkpoint_dir
                 ]
                 if len(existing_checkpoints) >= 2:
-                    # Remove the oldest checkpoint directory
-                    existing_checkpoints.sort()
-                    shutil.rmtree(os.path.join(checkpoint_saving_dir, existing_checkpoints[0]))
+                    # Remove the oldest checkpoint directory by (epoch, step)
+                    existing_checkpoints.sort(key=lambda x: [int(i) for i in x.split('-')[-2:][::-1]])
+                    for ckp in existing_checkpoints[:-1]:
+                        shutil.rmtree(os.path.join(checkpoint_saving_dir, ckp))
                 
                 if not args.use_lora:
                     save_checkpoint(transformer, rank, checkpoint_saving_dir, step, epoch)
