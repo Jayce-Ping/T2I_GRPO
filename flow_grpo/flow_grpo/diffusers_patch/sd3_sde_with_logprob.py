@@ -63,7 +63,8 @@ def denoising_step_with_logprob(
     prev_sample_mean = sample * (1 + std_dev_t**2 / (2 * sigma) * dt) + model_output * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt
     
     if generator is None:
-        # Determistic step - normal diffusion process
+        # Determistic step - normal diffusion process, based on ODE
+        # In this case, prev_sample == prev_sample_mean
         prev_sample = sample + dt * model_output
     else:
         # Non-determistic step, add noise to it

@@ -11,6 +11,7 @@ import torch
 import tqdm
 import wandb
 from argparse import Namespace
+from typing import List, Tuple, Any, Optional
 
 from absl import app, flags
 from accelerate import Accelerator
@@ -18,7 +19,7 @@ from accelerate.logging import get_logger
 from accelerate.utils import set_seed, ProjectConfiguration
 from collections import defaultdict
 from concurrent import futures
-from diffusers import FluxPipeline
+from diffusers import FluxPipeline, FluxTransformer2DModel
 from diffusers.utils.torch_utils import is_compiled_module
 from functools import partial
 from ml_collections import config_flags
@@ -44,7 +45,7 @@ config_flags.DEFINE_config_file("config", "config/base.py", "Training configurat
 logger = get_logger(__name__)
 
 class DistributedKRepeatSampler(Sampler):
-    def __init__(self, dataset, batch_size, k, num_replicas, rank, seed=0):
+    def __init__(self, dataset : Dataset, batch_size : int, k : int, num_replicas : int, rank : int, seed :int = 0):
         self.dataset = dataset
         self.batch_size = batch_size  # Batch size per replica
         self.k = k                    # Number of repetitions per sample
@@ -84,7 +85,7 @@ class DistributedKRepeatSampler(Sampler):
             # Return current replica's sample indices
             yield per_card_samples[self.rank]
     
-    def set_epoch(self, epoch):
+    def set_epoch(self, epoch : int):
         self.epoch = epoch  # Used to synchronize random state across epochs
 
 
@@ -134,7 +135,7 @@ def calculate_zero_std_ratio(prompts, gathered_rewards):
     
     return zero_std_ratio, prompt_std_devs.mean()
 
-def create_generator(prompts, base_seed):
+def create_generator(prompts : List[str], base_seed : int) -> List[torch.Generator]:
     generators = []
     for prompt in prompts:
         # Use a stable hash (SHA256), then convert it to an integer seed
@@ -145,8 +146,14 @@ def create_generator(prompts, base_seed):
         generators.append(gen)
     return generators
 
-        
-def compute_log_prob(transformer, pipeline, sample, j, config):
+
+def compute_log_prob(
+        transformer : FluxTransformer2DModel,
+        pipeline : FluxPipeline,
+        sample : dict[str, torch.Tensor],
+        j : int,
+        config : Namespace
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     packed_noisy_model_input = sample["latents"][:, j]
     device = packed_noisy_model_input.device
     dtype = packed_noisy_model_input.dtype
@@ -180,7 +187,20 @@ def compute_log_prob(transformer, pipeline, sample, j, config):
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
-def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
+def eval(pipeline,
+         test_dataloader,
+         text_encoders,
+         tokenizers,
+         config,
+         accelerator,
+         global_step,
+         reward_fn,
+         executor,
+         autocast,
+         num_train_timesteps,
+         ema,
+         transformer_trainable_parameters
+    ):
     if config.train.ema:
         ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
 
@@ -299,6 +319,9 @@ def load_pipeline(config : Namespace, accelerator : Accelerator):
 
     scheduler = FlowMatchSlidingWindowScheduler(
         window_size=config.sample.window_size,
+        iters_per_group=config.sample.iters_per_group,
+        left_boundary=config.sample.left_boundary,
+        right_boundary=config.sample.right_boundary,
         num_train_timesteps=config.sample.num_steps,
         **pipeline.scheduler.config.__dict__,
     )
@@ -386,7 +409,7 @@ def main(_):
     # TODO, modify here to add mixgrpo
     # number of timesteps within each trajectory to train on
     # num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction) # Original code
-    num_train_timesteps = config.sample.window_size # TODO, add window_size parameter in the config
+    num_train_timesteps = config.sample.window_size
 
     accelerator_config = ProjectConfiguration(
         project_dir=os.path.join(config.logdir, config.run_name),
@@ -610,10 +633,12 @@ def main(_):
             ).input_ids.to(accelerator.device)
 
             # sample
-            if config.sample.same_latent:
+            if not config.sample.same_latent:
+                # Different initial latent for each prompt
                 generator = create_generator(prompts, base_seed=epoch*10000+i)
             else:
-                generator = None
+                # Same initial latent for each prompt - simply use seed
+                generator = [torch.Generator(device=accelerator.device).manual_seed(config.seed) for _ in range(len(prompts))]
             with autocast():
                 with torch.no_grad():
                     images, latents, image_ids, text_ids, log_probs = pipeline_with_logprob(
@@ -822,7 +847,7 @@ def main(_):
                             config.train.adv_clip_max,
                         )
                         ratio = torch.exp(log_prob - sample["log_probs"][:, j])
-                        print("ratio", ratio)
+                        # print("ratio", ratio)
                         unclipped_loss = -advantages * ratio
                         clipped_loss = -advantages * torch.clamp(
                             ratio,

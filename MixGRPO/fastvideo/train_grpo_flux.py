@@ -665,7 +665,7 @@ def evaluate(
                         caption=f"Prompt {prompt[:min(prompt_len, 50)]}, Sample {img_idx}, Reward: {reward:.4f}"
                     ))
             
-                wandb_log_dict[f"eval/images"] = wandb_images
+                wandb_log_dict["eval/images"] = wandb_images
             
 
             wandb_log_dict["eval/global_reward_mean"] = np.mean(all_rewards)

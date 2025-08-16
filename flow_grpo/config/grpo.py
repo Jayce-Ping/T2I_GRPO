@@ -424,10 +424,10 @@ def pickscore_flux_8gpu():
     return config
 
 
-def general_ocr_flux_8gpu():
+def qwenvl_flux_8gpu():
     gpu_number=8
     config = compressibility()
-    config.dataset = os.path.join(os.getcwd(), "dataset/ocr")
+    config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
 
     # flux
     config.pretrained.model = FLUX_MODEL_PATH
@@ -453,9 +453,9 @@ def general_ocr_flux_8gpu():
     config.sample.noise_level = 0.9
     config.save_freq = 30 # epoch
     config.eval_freq = 30
-    config.save_dir = 'logs/ocr/flux-8gpu'
+    config.save_dir = 'logs/qwenvl/flux-8gpu'
     config.reward_fn = {
-        "ocr": 1.0,
+        "qwenvl": 1.0,
     }
     
     config.prompt_fn = "general_ocr"

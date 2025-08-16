@@ -28,4 +28,12 @@
 
 > Along the discrete denosing timesteps {0, 1, . . . , T −1}, MixGRPO defines a sliding window W (l) and optimization is only employed at the timesteps within this window.
 
-- Add scheduler for the above algorithm.
+- Add scheduler for the above algorithm. 
+
+
+# 8.17
+
+- FlowGRPO-Fast, looks similar to MixGRPO. Have a Check.
+
+- Think about how to include FlowGRPO-Fast in the MixGRPO condition.
+
