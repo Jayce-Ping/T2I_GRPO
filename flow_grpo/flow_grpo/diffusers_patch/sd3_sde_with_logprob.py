@@ -19,7 +19,7 @@ def denoising_step_with_logprob(
 ):
     """
     Predict the sample from the previous timestep by **reversing** the SDE. This function propagates the flow
-    process from the learned model outputs (most often the predicted velocity).
+    process from the learned model outputs (most often the predicted velocity). Specially, when noise_level is zero, the process becomes deterministic.
 
     Args:
         model_output (`torch.FloatTensor`):
@@ -33,7 +33,7 @@ def denoising_step_with_logprob(
         prev_sample (`torch.FloatTensor`):
             The next insance of the sample. If given, returns the log_probs between predicted prev_sample and given prev_sample, with no grad.
         generator (`torch.Generator`, *optional*):
-            A random number generator for SDE solving. If not given, use determistic denoising step (no noise added).
+            A random number generator for SDE solving. If not given, a random generator will be used.
     """
     # bf16 can overflow here when compute prev_sample_mean, we must convert all variable to fp32
     model_output=model_output.float()
@@ -62,13 +62,8 @@ def denoising_step_with_logprob(
 
     prev_sample_mean = sample * (1 + std_dev_t**2 / (2 * sigma) * dt) + model_output * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt
     
-    if generator is None:
-        # Determistic step - normal diffusion process, based on ODE
-        # In this case, prev_sample == prev_sample_mean
-        prev_sample = sample + dt * model_output
-    else:
+    if prev_sample is None:
         # Non-determistic step, add noise to it
-        assert prev_sample is None, ValueError("For non-determistic denoising step (for GRPO sampling), prev_sample cannot be provided.")
         variance_noise = randn_tensor(
             model_output.shape,
             generator=generator,

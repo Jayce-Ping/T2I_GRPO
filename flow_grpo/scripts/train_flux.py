@@ -648,8 +648,7 @@ def main(_):
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
-                        # num_inference_steps=config.sample.num_steps, # Original code
-                        sigmas=pipeline.scheduler.get_window_sigmas(),
+                        num_inference_steps=config.sample.num_steps, # Original code
                         guidance_scale=config.sample.guidance_scale,
                         output_type="pt",
                         height=config.resolution,

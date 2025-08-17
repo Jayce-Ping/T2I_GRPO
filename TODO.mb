@@ -35,7 +35,6 @@
 
 - FlowGRPO-Fast, looks similar to MixGRPO. Have a Check.
 
-- Think about how to include FlowGRPO-Fast in the MixGRPO condition.
+- Think about how to include FlowGRPO-Fast in the MixGRPO condition. (Check the source code of scheduler).
 
-
-- Modify Qwen inference using VLLM to save mem.
+- Modify Qwen inference using VLLM to save mem. ✅ Still need to experiment.
