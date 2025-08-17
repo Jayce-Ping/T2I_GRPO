@@ -652,7 +652,7 @@ def main(_):
                         guidance_scale=config.sample.guidance_scale,
                         output_type="pt",
                         height=config.resolution,
-                        width=config.resolution, 
+                        width=config.resolution,
                         noise_level=config.sample.noise_level,
                         generator=generator
                 )

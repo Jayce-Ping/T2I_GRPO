@@ -654,12 +654,7 @@ def evaluate(
 
                     prompt_len = len(prompt)
                     img_name = f"{rank}_{prompt_idx}_{img_idx}.jpg"
-                    img.save(
-                        os.path.join(tmpdir, img_name),
-                        format="JPEG",
-                        quality=90,
-                        optimize=True
-                    )
+                    img.save(os.path.join(tmpdir, img_name))
                     wandb_images.append(wandb.Image(
                         os.path.join(tmpdir, img_name),
                         caption=f"Prompt {prompt[:min(prompt_len, 50)]}, Sample {img_idx}, Reward: {reward:.4f}"

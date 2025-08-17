@@ -112,7 +112,11 @@ def qwenvl_score(device):
     from flow_grpo.rewards.qwenvl import QwenVLScorer
 
     # VLLM local deployment
-    scorer = QwenVLScorer(base_url='http://127.0.0.1:8000', api_key='dummy-key', model_name='QwenVl2.5-7B-Instruct')
+    scorer = QwenVLScorer(
+        base_url='http://127.0.0.1:8000/v1',
+        api_key='dummy-key',
+        model_name='QwenVL2.5-7B-Instruct'
+    )
 
     def _fn(images, prompts, metadata):
         if isinstance(images, torch.Tensor):
