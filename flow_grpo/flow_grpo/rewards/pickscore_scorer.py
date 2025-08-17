@@ -14,7 +14,7 @@ class PickScoreScorer(torch.nn.Module):
         self.model = self.model.to(dtype=dtype)
         
     @torch.no_grad()
-    def __call__(self, prompt, images):
+    def __call__(self, prompts : list[str], images : list[Image.Image]):
         # Preprocess images
         image_inputs = self.processor(
             images=images,
@@ -26,7 +26,7 @@ class PickScoreScorer(torch.nn.Module):
         image_inputs = {k: v.to(device=self.device) for k, v in image_inputs.items()}
         # Preprocess text
         text_inputs = self.processor(
-            text=prompt,
+            text=prompts,
             padding=True,
             truncation=True,
             max_length=77,

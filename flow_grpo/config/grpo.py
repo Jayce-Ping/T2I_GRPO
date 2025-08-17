@@ -13,6 +13,7 @@ def compressibility():
     config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
 
     config.use_lora = True
+    config.use_sliding_window = False
 
     config.sample.batch_size = 8
     config.sample.num_batches_per_epoch = 4

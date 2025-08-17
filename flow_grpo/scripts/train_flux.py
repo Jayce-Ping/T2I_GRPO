@@ -317,17 +317,18 @@ def load_pipeline(config : Namespace, accelerator : Accelerator):
         low_cpu_mem_usage=False
     )
 
-    scheduler = FlowMatchSlidingWindowScheduler(
-        window_size=config.sample.window_size,
-        iters_per_group=config.sample.iters_per_group,
-        left_boundary=config.sample.left_boundary,
-        right_boundary=config.sample.right_boundary,
-        num_train_timesteps=config.sample.num_steps,
-        **pipeline.scheduler.config.__dict__,
-    )
+    if config.use_sliding_window:
+        scheduler = FlowMatchSlidingWindowScheduler(
+            window_size=config.sample.window_size,
+            iters_per_group=config.sample.iters_per_group,
+            left_boundary=config.sample.left_boundary,
+            right_boundary=config.sample.right_boundary,
+            num_train_timesteps=config.sample.num_steps,
+            **pipeline.scheduler.config.__dict__,
+        )
 
-    # Overwrite the original scheduler
-    pipeline.scheduler = scheduler
+        # Overwrite the original scheduler
+        pipeline.scheduler = scheduler
 
     # freeze parameters of models to save more memory
     pipeline.vae.requires_grad_(False)
@@ -408,8 +409,10 @@ def main(_):
 
     # TODO, modify here to add mixgrpo
     # number of timesteps within each trajectory to train on
-    # num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction) # Original code
-    num_train_timesteps = config.sample.window_size
+    if config.use_sliding_window:
+        num_train_timesteps = config.sample.window_size
+    else:
+        num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction) # Original code
 
     accelerator_config = ProjectConfiguration(
         project_dir=os.path.join(config.logdir, config.run_name),
@@ -823,9 +826,8 @@ def main(_):
                 position=0,
                 disable=not accelerator.is_local_main_process,
             ):
-                train_timesteps = [step_index  for step_index in range(num_train_timesteps)]
                 for j in tqdm(
-                    train_timesteps,
+                    range(num_train_timesteps),
                     desc="Timestep",
                     position=1,
                     leave=False,

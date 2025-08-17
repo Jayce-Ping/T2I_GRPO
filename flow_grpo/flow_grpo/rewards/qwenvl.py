@@ -1,10 +1,12 @@
-from PIL import Image
 import torch
-import re
+import asyncio
 import base64
+import re
+from typing import Union
 from io import BytesIO
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor
-from qwen_vl_utils import process_vision_info
+from PIL import Image
+from openai import AsyncOpenAI
+
 
 def pil_image_to_base64(image):
     buffered = BytesIO()
@@ -13,106 +15,59 @@ def pil_image_to_base64(image):
     base64_qwen = f"data:image;base64,{encoded_image_text}"
     return base64_qwen
 
-def extract_scores(output_text):
+def extract_scores(output_texts : Union[list[str], str]):
+    if isinstance(output_texts, str):
+        output_texts = [output_texts]
+        return_list = False
+    else:
+        return_list = True
+
     scores = []
-    for text in output_text:
+    for text in output_texts:
         match = re.search(r'<Score>(\d+)</Score>', text)
         if match:
             scores.append(float(match.group(1))/5)
         else:
             scores.append(0)
-    return scores
 
-class QwenVLScorer(torch.nn.Module):
-    def __init__(self, device="cuda", dtype=torch.bfloat16):
-        super().__init__()
-        self.device = device
-        self.dtype = dtype
+    return scores if return_list else scores[0]
 
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            "Qwen/Qwen2.5-VL-7B-Instruct",
-            torch_dtype=self.dtype,
-            attn_implementation="flash_attention_2",
-            device_map=None,
-        ).to(self.device)
-        self.model.requires_grad_(False)
-        self.processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct", use_fast=True)
-        self.task = '''
-Your role is to evaluate the aesthetic quality score of given images.
-1. Bad: Extremely blurry, underexposed with significant noise, indiscernible
-subjects, and chaotic composition.
-2. Poor: Noticeable blur, poor lighting, washed-out colors, and awkward
-composition with cut-off subjects.
-3. Fair: In focus with adequate lighting, dull colors, decent composition but
-lacks creativity.
-4. Good: Sharp, good exposure, vibrant colors, thoughtful composition with
-a clear focal point.
-5. Excellent: Exceptional clarity, perfect exposure, rich colors, masterful
-composition with emotional impact.
+class QwenVLScorer:
+    def __init__(self, api_key=None, base_url='', model_name='QwenVl2.5-7B-Instruct'):
+        self.openai_api_key = api_key
+        self.openai_base_url = base_url
+        self.model_name = model_name
+        self.query = "Please rate how well the image matches the text on a scale of 1 to 5, with 5 being the best. Only respond with the score in the format <Score>n</Score>, where n is the score."
 
-Please first provide a detailed analysis of the evaluation process, including the criteria for judging aesthetic quality, within the <Thought> tag. Then, give a final score from 1 to 5 within the <Score> tag.
-<Thought>
-[Analyze the evaluation process in detail here]
-</Thought>
-<Score>X</Score>
-'''
-        
+        self.client = AsyncOpenAI(
+            api_key=self.openai_api_key,
+            base_url=self.openai_base_url,
+            model_name=self.model_name
+        )
+
+
     @torch.no_grad()
-    def __call__(self, prompt, images):
+    async def __call__(self, prompts: list[str], images: list[Image.Image]):
         images_base64 = [pil_image_to_base64(image) for image in images]
-        messages=[]
-        for base64_qwen in images_base64:
-            messages.append([
+        tasks = []
+        for prompt, base64_qwen in zip(prompts, images_base64):
+            messages = [
                 {
                     "role": "user",
                     "content": [
                         {"type": "image", "image": base64_qwen},
-                        {"type": "text", "text": self.task},
+                        {"type": "text", "text": prompt + "\n" + self.query},
                     ],
                 },
-            ])
-
-        # Preparation for batch inference
-        texts = [
-            self.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
-            for msg in messages
-        ]
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = self.processor(
-            text=texts,
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to(self.device)
-
-        # Batch Inference
-        generated_ids = self.model.generate(**inputs, max_new_tokens=2048)
-        generated_ids_trimmed = [
-            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        output_texts = self.processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        rewards = extract_scores(output_texts)
-        return rewards
-
-# Usage example
-def main():
-    scorer = QwenVLScorer(
-        device="cuda",
-        dtype=torch.bfloat16
-    )
-    images=[
-    "nasa.jpg",
-    ]
-    pil_images = [Image.open(img) for img in images]
-    prompts=[
-        'A astronaut’s glove floating in zero-g with "NASA 2049" on the wrist',
-    ]
-
-    print(scorer(None, pil_images))
-
-if __name__ == "__main__":
-    main()
+            ]
+            tasks.append(
+                self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    max_tokens=32,
+                    temperature=0.0,
+                )
+            )
+        responses = await asyncio.gather(*tasks)
+        output_texts = [resp.choices[0].message.content for resp in responses]
+        return extract_scores(output_texts)
