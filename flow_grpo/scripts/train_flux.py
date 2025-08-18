@@ -188,7 +188,7 @@ def compute_log_prob(
         model_pred.float(),
         sample["timesteps"][:, j],
         sample["latents"][:, j].float(),
-        noise_level=noise_level
+        noise_level=noise_level,
         prev_sample=sample["next_latents"][:, j].float(),
     )
 
