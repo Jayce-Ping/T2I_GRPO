@@ -1,15 +1,17 @@
 import os
+import re
 import json
 from typing import List, Tuple, Union
-import os
-import re
 from io import BytesIO
 import base64
 import logging
+import asyncio
+from itertools import combinations
 
 import torch
 import numpy as np
-from openai import OpenAI
+import openai
+from openai import OpenAI, AsyncOpenAI
 from PIL import Image
 
 # VLLM log filter
@@ -53,6 +55,18 @@ def extract_grid_info(prompt) -> tuple[int, int]:
     return (int(match[0][0]), int(match[0][1]))
 
 
+def get_score_from_completion(completion : openai.ChatCompletion) -> float:
+    logprobs = completion.choices[0].logprobs
+    if logprobs:
+        token_probs = {t.token.lower(): float(np.exp(t.logprob)) for t in logprobs.content[0].top_logprobs}
+        score = token_probs.get('yes', 0.0) # Other method to measure score?
+    else:
+        # log_prob cannot be derived here. How to calculate?
+        # TODO
+        score = 0.0
+
+    return score
+
 
 class ConsistencyScorer:
     def __init__(
@@ -60,16 +74,26 @@ class ConsistencyScorer:
             api_key='dummy_key',
             base_url='http://127.0.0.1:8000/v1',
             model_name='QwenVL2.5-7B-Instruct',
-            criteria_path='prompt_consistency_criterion.json'
+            criteria_path='prompt_consistency_criterion.json',
+            async_mode=True
         ):
         self.openai_api_key = api_key
         self.openai_base_url = base_url
         self.model_name = model_name
+        self.async_model = async_mode
 
-        self.client = OpenAI(
-            api_key=self.openai_api_key,
-            base_url=self.openai_base_url
-        )
+
+        if async_mode:
+            self.client = AsyncOpenAI(
+                api_key=self.openai_api_key,
+                base_url=self.openai_base_url
+            )
+        else:
+            self.client = OpenAI(
+                api_key=self.openai_api_key,
+                base_url=self.openai_base_url
+            )
+
 
         with open(criteria_path, 'r') as f:
             self.criteria_data = json.load(f)
@@ -81,8 +105,6 @@ class ConsistencyScorer:
 
         final_scores = []
         for prompt, image, metadata in zip(prompts, images, metadatas):
-            grid_info = extract_grid_info(prompt)
-            sub_images = divide_image(image, grid_info)
             criteria_info = self.criteria_data[metadata['idx']]
 
             dimensions = criteria_info.keys()
@@ -91,22 +113,13 @@ class ConsistencyScorer:
             for dimension in dimensions:
                 # Get criteria for this dimension
                 dimension_criteria = criteria_info[dimension][0]  # Get the first (and only) dictionary in the list
-                criterion_texts = list(dimension_criteria.values())
-                criterion_scores = [] # each item is a list of scores, each score is for one criterion
-                # Compute each pair of neighbors
-                for i in range(len(sub_images) - 1):
-                    for j in range(i + 1, len(sub_images)):
-                        img1 = sub_images[i]
-                        img2 = sub_images[j]
+                criteria_texts = list(dimension_criteria.values())
 
-                        scores = self.compute_image_consistency(img1, img2, criterion_texts)
-
-                        criterion_scores.append(scores)
-
-                # Transpose criterion_scores, to make each item is a list of scores for each criterion
-                criterion_scores = list(map(list, zip(*criterion_scores)))
+                # [criteria1_scores : list[float], criteria2_scores : list[float], ...]
+                criterion_scores = [self.compute_image_consistency(prompt, image, ct) for ct in criteria_texts]
 
                 # Compute the average score within each criterion
+                # [criteria1_avg_score, criteria2_avg_score, ...]
                 criterion_scores = [sum(scores) / len(scores) if scores else 0.0 for scores in criterion_scores]
 
                 # Compute the overall score for this dimension
@@ -117,28 +130,44 @@ class ConsistencyScorer:
             final_scores.append(sum(dimension_scores.values()) / len(dimension_scores))
 
         return final_scores
+    
 
     def compute_image_consistency(
             self,
-            image1 : Image.Image,
-            image2 : Image.Image,
-            criterion_texts : list[str],
+            prompt : str,
+            image : Image.Image,
+            criteria_text : str,
             top_logprobs: int = 5
-        ) -> list[float]:
+        ):
+        if self.async_model:
+            return asyncio.run(self._async_compute_image_consistency(prompt, image, criteria_text, top_logprobs))
+        else:
+            return self._sync_compute_image_consistency(prompt, image, criteria_text, top_logprobs)
+
+    async def _async_compute_image_consistency(
+            self,
+            prompt : str,
+            image : Image.Image,
+            criteria_text : str,
+            top_logprobs: int = 5
+        ):
         """
-        Compute the consistency score between two images, for each given criterion.
+        Async version of compute_image_consistency.
         """
-        scores = []
-        for criterion_text in criterion_texts:
+        completions = []
+        grid_info = extract_grid_info(prompt)
+        sub_images = divide_image(image, grid_info)
+        for image1, image2 in combinations(sub_images, 2):
             messages = [
                 {
                     "role": "user",
-                    "content": [
+                    "content":
+                    [
                         {"type": "image_url", "image_url": {"url": pil_image_to_base64(image1)}},
-                    {"type": "image_url", "image_url": {"url": pil_image_to_base64(image2)}},
-                    {"type": "text", "text": f"Do images meet the following criteria? {criterion_text} Please answer Yes or No."},
-                ],
-            }
+                        {"type": "image_url", "image_url": {"url": pil_image_to_base64(image2)}},
+                        {"type": "text", "text": f"Do images meet the following criteria? {criteria_text} Please answer Yes or No."},
+                    ]
+                }
             ]
 
             completion = self.client.chat.completions.create(
@@ -149,15 +178,51 @@ class ConsistencyScorer:
                 logprobs=True,
                 top_logprobs=top_logprobs
             )
-            log_probs = completion.choices[0].logprobs
-            if log_probs:
-                token_probs = {t.token.lower(): float(np.exp(t.logprob)) for t in log_probs.content[0].top_logprobs}
-                score = token_probs.get('yes', 0.0) # Other method to measure score?
-            else:
-                # log_prob cannot be derived here. How to calculate?
-                # TODO
-                score = 0.0
 
-            scores.append(score)
+            completions.append(completion)
 
-        return scores
+
+        res = await asyncio.gather(*completions)
+
+        return [get_score_from_completion(c) for c in res]
+
+
+    def _sync_compute_image_consistency(
+            self,
+            prompt : str,
+            image : Image.Image,
+            criteria_text : str,
+            top_logprobs: int = 5
+        ) -> list[float]:
+        """
+        Compute the consistency score of a image, for a given criterion.
+        """
+        completions = []
+        grid_info = extract_grid_info(prompt)
+        sub_images = divide_image(image, grid_info)
+        for image1, image2 in combinations(sub_images, 2):
+            messages = [
+                {
+                    "role": "user",
+                    "content":
+                    [
+                        {"type": "image_url", "image_url": {"url": pil_image_to_base64(image1)}},
+                        {"type": "image_url", "image_url": {"url": pil_image_to_base64(image2)}},
+                        {"type": "text", "text": f"Do images meet the following criteria? {criteria_text} Please answer Yes or No."},
+                    ]
+                }
+            ]
+
+            completion = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=0.0, # Deterministic result,
+                max_completion_tokens=1,
+                logprobs=True,
+                top_logprobs=top_logprobs
+            )
+
+            completions.append(completion)
+
+
+        return [get_score_from_completion(c) for c in completions]
