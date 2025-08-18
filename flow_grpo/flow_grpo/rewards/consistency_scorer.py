@@ -1,40 +1,28 @@
 import os
 import json
-import numpy as np
-from tqdm import tqdm
-from PIL import Image
-import torch
-import argparse
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor
-from qwen_vl_utils import process_vision_info
-from transformers import GenerationConfig
-from PIL import Image
-import torch.nn.functional as F
 from typing import List, Tuple, Union
 import os
 import re
 from io import BytesIO
 import base64
+import logging
 
-from PIL import Image
 import torch
-import re
-import base64
-from io import BytesIO
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor
-from qwen_vl_utils import process_vision_info
+import numpy as np
+from openai import OpenAI
+from PIL import Image
 
-def PIL_image_to_base64(image: Image.Image, format='JPEG') -> str:
+# VLLM log filter
+logging.getLogger("vllm").setLevel(logging.ERROR)
+logging.getLogger().setLevel(logging.ERROR)
+
+
+def pil_image_to_base64(image, format="JPEG"):
     buffered = BytesIO()
-
-    image.save(buffered, format=format)
-
-    img_bytes = buffered.getvalue()
-
-    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-
-    return img_base64
-
+    image.save(buffered, format="JPEG")
+    encoded_image_text = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    base64_qwen = f"data:image/{format.lower()};base64,{encoded_image_text}"
+    return base64_qwen
 
 def divide_image(image, grid_info : tuple[int, int]):
     assert len(grid_info) == 2, "grid_info must be a tuple of two integers (a, b)"
@@ -66,26 +54,20 @@ def extract_grid_info(prompt) -> tuple[int, int]:
 
 
 
-def load_model(model_path, dtype=torch.bfloat16, device="cuda"):
-    # Load the model on the available device(s)
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, torch_dtype=dtype, device_map=None).to(device)
+class ConsistencyScorer:
+    def __init__(self, api_key='dummy_key', base_url='http://127.0.0.1:8000/v1', model_name='QwenVL2.5-7B-Instruct'):
+        self.openai_api_key = api_key
+        self.openai_base_url = base_url
+        self.model_name = model_name
 
-    # default processer
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
-    
-    return model, processor
-
-
-class ConsistencyScorer(torch.nn.Module):
-    def __init__(self, qwen_model_path, criteria_path, device, dtype=torch.bfloat16):
-        self.model_path = qwen_model_path
-        self.device = device
-        self.dtype = dtype
-        self.model, self.processor = load_model(self.model_path, dtype=self.dtype, device=self.device)
-        self.model.requires_grad_(False)
+        self.client = OpenAI(
+            api_key=self.openai_api_key,
+            base_url=self.openai_base_url
+        )
 
         with open(criteria_path, 'r') as f:
             self.criteria_data = json.load(f)
+
 
     @torch.no_grad()
     def __call__(self, images : list[Image.Image], prompts : list[str]) -> list[float]:
@@ -110,45 +92,49 @@ class ConsistencyScorer(torch.nn.Module):
                     for j in range(i + 1, len(sub_images)):
                         img1 = sub_images[i]
                         img2 = sub_images[j]
-
-                        messages = [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "image", "image": f"data:image;base64,{PIL_image_to_base64(img1)}", "resized_height": 512, "resized_width": 512},
-                                    {"type": "image", "image": f"data:image;base64,{PIL_image_to_base64(img2)}", "resized_height": 512, "resized_width": 512},
-                                    {"type": "text", "text": f"Do images meet the following criteria? {criterion_text} Please answer Yes or No."},
-                                ],
-                            }
-                        ]
-
-                        # Prepare for inference
-                        text = self.processor.apply_chat_template(
-                            messages, tokenize=False, add_generation_prompt=True
-                        )
-                        image_inputs, video_inputs = process_vision_info(messages)
-                        inputs = self.processor(
-                            text=[text],
-                            images=image_inputs,
-                            videos=video_inputs,
-                            padding=True,
-                            return_tensors="pt",
-                        )
-                        inputs = inputs.to("cuda")
-
-                        generated_ids = self.model.generate(**inputs, max_new_tokens=1, return_dict_in_generate=True, output_scores=True, output_logits=True)
-                        logits = generated_ids.logits
-
-                        no_logits = logits[0][0][2753]
-                        yes_logits = logits[0][0][9454]
-
-                        # Calculate softmax
-                        logits = torch.tensor([no_logits, yes_logits])
-                        softmax = torch.nn.functional.softmax(logits, dim=0)
-                        yes_softmax = softmax[1].item()
-
-                        dimension_scores[dimension]["scores"]
-
-
+                        
+                        score = self.compute_image_consistency(img1, img2, dimension_criteria)
+                        
 
         return scores
+
+    def compute_image_consistency(
+            self,
+            image1 : Image.Image,
+            image2 : Image.Image,
+            criterion_text: str,
+            top_logprobs: int = 5
+        ) -> float:
+        """
+        Compute the consistency score between two images.
+        """
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": pil_image_to_base64(image1)}},
+                    {"type": "image_url", "image_url": {"url": pil_image_to_base64(image2)}},
+                    {"type": "text", "text": f"Do images meet the following criteria? {criterion_text} Please answer Yes or No."},
+                ],
+            }
+        ]
+
+        # TODO: finish it
+        completion = self.client.chat.completions.create(
+            model_name=self.model_name,
+            messages=messages,
+            temperature=0.0, # Deterministic result,
+            max_completion_tokens=1,
+            logprobs=True,
+            top_logprobs=top_logprobs
+        )
+        log_probs = completion.choices[0].logprobs
+        if log_probs:
+            token_probs = {t.token.lower(): float(np.exp(t.logprob)) for t in log_probs.content[0].top_logprobs}
+            score = token_probs.get('yes', 0.0) # Other method to measure score?
+        else:
+            # log_prob cannot be derived here. How to calculate?
+            # TODO
+            score = 0.0
+
+        return score

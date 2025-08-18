@@ -52,4 +52,4 @@ Flow-GRPO Config:
     config.per_prompt_stat_tracking = True
 ```
 
-上述配置，修改resolution=1024 -> Eval和Train都满80/82。
+上述配置，修改resolution=1024 -> Eval和Train都满 ~80/82。

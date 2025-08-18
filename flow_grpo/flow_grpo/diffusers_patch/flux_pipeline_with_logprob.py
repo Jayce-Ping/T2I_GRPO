@@ -20,7 +20,7 @@ def calculate_shift(
 
 @torch.no_grad()
 def pipeline_with_logprob(
-    self,
+    pipeline,
     prompt: Union[str, List[str]] = None,
     prompt_2: Optional[Union[str, List[str]]] = None,
     negative_prompt: Union[str, List[str]] = None,
@@ -41,13 +41,13 @@ def pipeline_with_logprob(
     joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     callback_on_step_end_tensor_inputs: List[str] = ["latents"],
     max_sequence_length: int = 512,
-    noise_level: float = 0.7,
+    noise_level: Optional[float] = None,
 ):
-    height = height or self.default_sample_size * self.vae_scale_factor
-    width = width or self.default_sample_size * self.vae_scale_factor
+    height = height or pipeline.default_sample_size * pipeline.vae_scale_factor
+    width = width or pipeline.default_sample_size * pipeline.vae_scale_factor
 
     # 1. Check inputs. Raise error if not correct
-    self.check_inputs(
+    pipeline.check_inputs(
         prompt,
         prompt_2,
         height,
@@ -62,10 +62,10 @@ def pipeline_with_logprob(
         max_sequence_length=max_sequence_length,
     )
 
-    self._guidance_scale = guidance_scale
-    self._joint_attention_kwargs = joint_attention_kwargs
-    self._current_timestep = None
-    self._interrupt = False
+    pipeline._guidance_scale = guidance_scale
+    pipeline._joint_attention_kwargs = joint_attention_kwargs
+    pipeline._current_timestep = None
+    pipeline._interrupt = False
 
     # 2. Define call parameters
     if prompt is not None and isinstance(prompt, str):
@@ -75,16 +75,18 @@ def pipeline_with_logprob(
     else:
         batch_size = prompt_embeds.shape[0]
 
-    device = self._execution_device
+    device = pipeline._execution_device
 
     lora_scale = (
-        self.joint_attention_kwargs.get("scale", None) if self.joint_attention_kwargs is not None else None
+        pipeline.joint_attention_kwargs.get("scale", None)
+        if pipeline.joint_attention_kwargs is not None else None
     )
+    
     (
         prompt_embeds,
         pooled_prompt_embeds,
         text_ids,
-    ) = self.encode_prompt(
+    ) = pipeline.encode_prompt(
         prompt=prompt,
         prompt_2=prompt_2,
         prompt_embeds=prompt_embeds,
@@ -96,8 +98,8 @@ def pipeline_with_logprob(
     )
 
     # 4. Prepare latent variables
-    num_channels_latents = self.transformer.config.in_channels // 4
-    latents, latent_image_ids = self.prepare_latents(
+    num_channels_latents = pipeline.transformer.config.in_channels // 4
+    latents, latent_image_ids = pipeline.prepare_latents(
         batch_size * num_images_per_prompt,
         num_channels_latents,
         height,
@@ -108,28 +110,28 @@ def pipeline_with_logprob(
         latents,
     )
     sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
-    if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
+    if hasattr(pipeline.scheduler.config, "use_flow_sigmas") and pipeline.scheduler.config.use_flow_sigmas:
         sigmas = None
     image_seq_len = latents.shape[1]
     mu = calculate_shift(
         image_seq_len,
-        self.scheduler.config.get("base_image_seq_len", 256),
-        self.scheduler.config.get("max_image_seq_len", 4096),
-        self.scheduler.config.get("base_shift", 0.5),
-        self.scheduler.config.get("max_shift", 1.15),
+        pipeline.scheduler.config.get("base_image_seq_len", 256),
+        pipeline.scheduler.config.get("max_image_seq_len", 4096),
+        pipeline.scheduler.config.get("base_shift", 0.5),
+        pipeline.scheduler.config.get("max_shift", 1.15),
     )
     timesteps, num_inference_steps = retrieve_timesteps(
-        self.scheduler,
+        pipeline.scheduler,
         num_inference_steps,
         device,
         sigmas=sigmas,
         mu=mu,
     )
-    num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
-    self._num_timesteps = len(timesteps)
+    num_warmup_steps = max(len(timesteps) - num_inference_steps * pipeline.scheduler.order, 0)
+    pipeline._num_timesteps = len(timesteps)
 
     # handle guidance
-    if self.transformer.config.guidance_embeds:
+    if pipeline.transformer.config.guidance_embeds:
         guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
         guidance = guidance.expand(latents.shape[0])
     else:
@@ -140,15 +142,20 @@ def pipeline_with_logprob(
     all_log_probs = []
 
     # 7. Denoising loop
-    self.scheduler.set_begin_index(0)
-    with self.progress_bar(total=num_inference_steps) as progress_bar:
+    pipeline.scheduler.set_begin_index(0)
+    with pipeline.progress_bar(total=num_inference_steps) as progress_bar:
         for i, t in enumerate(timesteps):
-            if self.interrupt:
+            if pipeline.interrupt:
                 continue
-            self._current_timestep = t
+            pipeline._current_timestep = t
+
+            # Get noise_level. If not given in the arguments, use the sliding window scheduler's method to retrieve it.
+            current_noise_level = noise_level if noise_level is not None else pipeline.scheduler.get_noise_level_for_timestep(t)
+
             # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
-            noise_pred = self.transformer(
+
+            noise_pred = pipeline.transformer(
                 hidden_states=latents,
                 timestep=timestep / 1000,
                 guidance=guidance,
@@ -156,17 +163,19 @@ def pipeline_with_logprob(
                 encoder_hidden_states=prompt_embeds,
                 txt_ids=text_ids,
                 img_ids=latent_image_ids,
-                joint_attention_kwargs=self.joint_attention_kwargs,
+                joint_attention_kwargs=pipeline.joint_attention_kwargs,
                 return_dict=False,
             )[0]
+
             noise_pred = noise_pred.to(prompt_embeds.dtype)
             latents_dtype = latents.dtype
+
             latents, log_prob, prev_latents_mean, std_dev_t = denoising_step_with_logprob(
-                self.scheduler,
+                pipeline.scheduler,
                 noise_pred.float(),
                 t.unsqueeze(0).repeat(latents.shape[0]),
                 latents.float(),
-                noise_level=noise_level,
+                noise_level=current_noise_level,
                 prev_sample=None,
                 generator=generator # Add different generator for each step, a solution is to use given generator to generate new random generators.
             )
@@ -175,16 +184,16 @@ def pipeline_with_logprob(
             all_latents.append(latents)
             all_log_probs.append(log_prob)
             # call the callback, if provided
-            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % pipeline.scheduler.order == 0):
                 progress_bar.update()
 
-    latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
-    latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
-    latents = latents.to(dtype=self.vae.dtype)
-    image = self.vae.decode(latents, return_dict=False)[0]
-    image = self.image_processor.postprocess(image, output_type=output_type)
+    latents = pipeline._unpack_latents(latents, height, width, pipeline.vae_scale_factor)
+    latents = (latents / pipeline.vae.config.scaling_factor) + pipeline.vae.config.shift_factor
+    latents = latents.to(dtype=pipeline.vae.dtype)
+    image = pipeline.vae.decode(latents, return_dict=False)[0]
+    image = pipeline.image_processor.postprocess(image, output_type=output_type)
 
     # Offload all models
-    self.maybe_free_model_hooks()
+    pipeline.maybe_free_model_hooks()
 
     return image, all_latents, latent_image_ids, text_ids, all_log_probs

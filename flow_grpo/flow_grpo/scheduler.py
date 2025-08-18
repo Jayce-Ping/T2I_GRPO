@@ -13,35 +13,39 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 class FlowMatchSlidingWindowScheduler(FlowMatchEulerDiscreteScheduler):
     def __init__(
         self,
-        window_size: int,
         noise_level : float = 0.7,
+        window_size: int = 1000,
         iters_per_group: int = 25,
         left_boundary : int = 0,
-        right_boundary : Optional[int] = None,
         sample_strategy: str = "progressive",
         prog_overlap_step: int = 1,
         roll_back: bool = False,
         **kwargs
     ):
         super().__init__(**kwargs)
-        self.window_size = window_size
+        self._window_size = min(window_size, self.config.num_train_timesteps)
         self.noise_level = noise_level
         self.iters_per_group = iters_per_group
         self.left_boundary = left_boundary
-        self.right_boundary = right_boundary if right_boundary is not None else self.config.num_train_timesteps
         self.sample_strategy = sample_strategy
         self.prog_overlap_step = prog_overlap_step
         self.roll_back = roll_back
 
         assert self.noise_level >= 0 and self.noise_level <= 1, "Noise level must be between 0 and 1."
-        assert self.window_size > 0, "Window size must be greater than 0."
+        assert self._window_size > 0, "Window size must be greater than 0."
         assert self.left_boundary >= 0, "Left boundary must be non-negative."
-        assert self.right_boundary > self.left_boundary, "Right boundary must be greater than left boundary."
-        assert self.prog_overlap_step < self.window_size, "Progressive overlap step must be less than window size."
+        assert self.prog_overlap_step < self._window_size, "Progressive overlap step must be less than window size."
         assert self.sample_strategy in ["progressive", "random"], f"Sample strategy must be one of ['progressive', 'random']. {sample_strategy} is not supported."
 
         self.cur_timestep = self.left_boundary
         self.cur_iter_in_group = 0
+
+    @property
+    def window_size(self):
+        if self._window_size > self.config.num_train_timesteps:
+            self._window_size = self.config.num_train_timesteps
+        
+        return self._window_size
 
     def update_iteration(self, seed=None):
         self.cur_iter_in_group += 1
@@ -78,6 +82,15 @@ class FlowMatchSlidingWindowScheduler(FlowMatchEulerDiscreteScheduler):
         noise_levels[window_indices] = self.noise_level
         return noise_levels
     
+    def get_noise_level_for_timestep(self, time_step) -> float:
+        """
+            Return the noise level for a specific timestep.
+        """
+        if self.left_boundary <= self.index_for_timestep(time_step) <= self.right_boundary:
+            return self.noise_level
+
+        return 0.0
+
     def is_training_complete(self):
         if self.cur_iter_in_group >= self.iters_per_group:
             return True

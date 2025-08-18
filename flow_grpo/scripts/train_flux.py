@@ -155,8 +155,14 @@ def compute_log_prob(
         config : Namespace
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     packed_noisy_model_input = sample["latents"][:, j]
+    time_steps = sample["timesteps"][:, j]
+    # Since the time_steps are copied after sampling, each batch of time_step should equal
+    # noise_levels = [pipeline.scheduler.get_noise_level_for_timestep(t) for t in time_steps]
+    noise_level = pipeline.scheduler.get_noise_level_for_timestep(time_steps[0]) # So, all noise levels are equal
+
     device = packed_noisy_model_input.device
     dtype = packed_noisy_model_input.dtype
+
     if transformer.module.config.guidance_embeds:
         guidance = torch.tensor([config.sample.guidance_scale], device=device)
         guidance = guidance.expand(packed_noisy_model_input.shape[0])
@@ -174,6 +180,7 @@ def compute_log_prob(
         img_ids=sample["image_ids"][0],
         return_dict=False,
     )[0]
+    
     # compute the log prob of next_latents given latents under the current model
     # Here, use determistic denoising for normal diffusion process.
     prev_sample, log_prob, prev_sample_mean, std_dev_t = denoising_step_with_logprob(
@@ -181,7 +188,7 @@ def compute_log_prob(
         model_pred.float(),
         sample["timesteps"][:, j],
         sample["latents"][:, j].float(),
-        noise_level=config.sample.noise_level,
+        noise_level=noise_level
         prev_sample=sample["next_latents"][:, j].float(),
     )
 
@@ -319,6 +326,7 @@ def load_pipeline(config : Namespace, accelerator : Accelerator):
 
     if config.use_sliding_window:
         scheduler = FlowMatchSlidingWindowScheduler(
+            noise_level=config.sample.noise_level,
             window_size=config.sample.window_size,
             iters_per_group=config.sample.iters_per_group,
             left_boundary=config.sample.left_boundary,
@@ -326,9 +334,13 @@ def load_pipeline(config : Namespace, accelerator : Accelerator):
             num_train_timesteps=config.sample.num_steps,
             **pipeline.scheduler.config.__dict__,
         )
+    else:
+        scheduler = FlowMatchSlidingWindowScheduler(
+            noise_level=config.sample.noise_level,
+        )
 
-        # Overwrite the original scheduler
-        pipeline.scheduler = scheduler
+    # Overwrite the original scheduler
+    pipeline.scheduler = scheduler
 
     # freeze parameters of models to save more memory
     pipeline.vae.requires_grad_(False)
@@ -407,12 +419,8 @@ def main(_):
     else:
         config.run_name += "_" + unique_id
 
-    # TODO, modify here to add mixgrpo
     # number of timesteps within each trajectory to train on
-    if config.use_sliding_window:
-        num_train_timesteps = config.sample.window_size
-    else:
-        num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction) # Original code
+    num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
 
     accelerator_config = ProjectConfiguration(
         project_dir=os.path.join(config.logdir, config.run_name),
@@ -648,12 +656,11 @@ def main(_):
                         pipeline,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
-                        num_inference_steps=config.sample.num_steps, # Original code
+                        num_inference_steps=config.sample.num_steps,
                         guidance_scale=config.sample.guidance_scale,
                         output_type="pt",
                         height=config.resolution,
                         width=config.resolution,
-                        noise_level=config.sample.noise_level,
                         generator=generator
                 )
 
@@ -797,6 +804,8 @@ def main(_):
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
 
+
+        # A assertion to ensure the number of timesteps is consistent
         assert num_timesteps == config.sample.num_steps
 
         #################### TRAINING ####################

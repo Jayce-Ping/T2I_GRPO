@@ -37,9 +37,11 @@
 
 - Think about how to include FlowGRPO-Fast in the MixGRPO condition. (Check the source code of scheduler).
 
-- Modify Qwen inference using VLLM to save mem. ✅ Still need to experiment.
+- Modify Qwen inference using VLLM to save mem. ✅ Still need to experiment.✅
 
 
 - Add noise level control. noise_level = 0 gives deterministic denoising process.
 Use noise_level to control determinism. Scheduler has been done?
 Function pipeline_with_log_prob needs to accecpt different noise_level for each time_step, rather than the same.
+
+- How to get log_probs when using API?
