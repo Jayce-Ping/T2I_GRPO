@@ -76,26 +76,23 @@ class ConsistencyScorer:
 
 
     @torch.no_grad()
-    def __call__(self, images : list[Image.Image], prompts : list[str], metadatas : dict) -> list[float]:
+    def __call__(self, images : list[Image.Image], prompts : list[str], metadatas : list[dict]) -> list[float]:
         assert len(prompts) == len(images), "Length of prompts and images must match"
-
-        prompt_to_id = {v['prompt'] : k for k, v in metadatas.items()}
-
-        prompt_to_criteria = {prompt: self.criteria_data[prompt_to_id[prompt]] for prompt in prompts}
 
         dimension_scores : dict[str, list[list[float]]]= {
             "Style": [],
             "Identity": [],
             "Logic": []
         }
-        for prompt, image in zip(prompts, images):
+        for prompt, image, metadata in zip(prompts, images, metadatas):
             grid_info = extract_grid_info(prompt)
             sub_images = divide_image(image, grid_info)
+            criteria_info = self.criteria_data[metadata['idx']]
     
             # Compute scores for each prompt-image pair from different dimensions
             for dimension in ["Style", "Identity", "Logic"]:
                 # Get criteria for this dimension
-                dimension_criteria = prompt_to_criteria[dimension][0]  # Get the first (and only) dictionary in the list
+                dimension_criteria = criteria_info[dimension][0]  # Get the first (and only) dictionary in the list
                 criterion_texts = list(dimension_criteria.values())
                 criterion_scores = [] # each item is a list of scores, each score is for one criterion
                 # Compute each pair of neighbors
@@ -143,7 +140,7 @@ class ConsistencyScorer:
             ]
 
             completion = self.client.chat.completions.create(
-                model_name=self.model_name,
+                model=self.model_name,
                 messages=messages,
                 temperature=0.0, # Deterministic result,
                 max_completion_tokens=1,

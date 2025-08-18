@@ -430,6 +430,7 @@ def multi_score(device, score_dict):
         "geneval": geneval_score,
         "clipscore": clip_score,
         "image_similarity": image_similarity_score,
+        "consistency_score": consistency_score
     }
     score_fns={}
     for score_name, weight in score_dict.items():
