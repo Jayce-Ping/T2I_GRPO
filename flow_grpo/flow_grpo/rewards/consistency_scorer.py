@@ -55,7 +55,13 @@ def extract_grid_info(prompt) -> tuple[int, int]:
 
 
 class ConsistencyScorer:
-    def __init__(self, api_key='dummy_key', base_url='http://127.0.0.1:8000/v1', model_name='QwenVL2.5-7B-Instruct'):
+    def __init__(
+            self,
+            api_key='dummy_key',
+            base_url='http://127.0.0.1:8000/v1',
+            model_name='QwenVL2.5-7B-Instruct',
+            criteria_path='prompt_consistency_criterion.json'
+        ):
         self.openai_api_key = api_key
         self.openai_base_url = base_url
         self.model_name = model_name
@@ -70,71 +76,89 @@ class ConsistencyScorer:
 
 
     @torch.no_grad()
-    def __call__(self, images : list[Image.Image], prompts : list[str]) -> list[float]:
+    def __call__(self, images : list[Image.Image], prompts : list[str], metadatas : dict) -> list[float]:
         assert len(prompts) == len(images), "Length of prompts and images must match"
 
-        dimension_scores = {
-            "Style": {"scores": [], "criteria": []},
-            "Identity": {"scores": [], "criteria": []},
-            "Logic": {"scores": [], "criteria": []}
+        prompt_to_id = {v['prompt'] : k for k, v in metadatas.items()}
+
+        prompt_to_criteria = {prompt: self.criteria_data[prompt_to_id[prompt]] for prompt in prompts}
+
+        dimension_scores : dict[str, list[list[float]]]= {
+            "Style": [],
+            "Identity": [],
+            "Logic": []
         }
-        for dimension in ["Style", "Identity", "Logic"]:
-            # Get criteria for this dimension
-            dimension_criteria = case_criteria[dimension][0]  # Get the first (and only) dictionary in the list
-            dimension_scores[dimension]["criteria"] = list(dimension_criteria.values())
-
-            for prompt, image in zip(prompts, images):
-                grid_info = extract_grid_info(prompt)
-                sub_images = divide_image(image, grid_info)
-
+        for prompt, image in zip(prompts, images):
+            grid_info = extract_grid_info(prompt)
+            sub_images = divide_image(image, grid_info)
+    
+            # Compute scores for each prompt-image pair from different dimensions
+            for dimension in ["Style", "Identity", "Logic"]:
+                # Get criteria for this dimension
+                dimension_criteria = prompt_to_criteria[dimension][0]  # Get the first (and only) dictionary in the list
+                criterion_texts = list(dimension_criteria.values())
+                criterion_scores = [] # each item is a list of scores, each score is for one criterion
                 # Compute each pair of neighbors
                 for i in range(len(sub_images) - 1):
                     for j in range(i + 1, len(sub_images)):
                         img1 = sub_images[i]
                         img2 = sub_images[j]
-                        
-                        score = self.compute_image_consistency(img1, img2, dimension_criteria)
-                        
 
-        return scores
+                        scores = self.compute_image_consistency(img1, img2, criterion_texts)
+
+                        criterion_scores.append(scores)
+
+                # Transpose dimension_scores, to make each item is a list of scores for each criterion
+                criterion_scores = list(map(list, zip(*criterion_scores)))
+                # Compute the average score within each criterion
+                criterion_scores = [sum(scores) / len(scores) if scores else 0.0 for scores in criterion_scores]
+
+                dimension_scores[dimension].append(criterion_scores)
+
+        # Compute average scores from each dimension
+        final_scores = [sum(x) / len(x) for x in zip(*dimension_scores.values())]
+        return final_scores
 
     def compute_image_consistency(
             self,
             image1 : Image.Image,
             image2 : Image.Image,
-            criterion_text: str,
+            criterion_texts : list[str],
             top_logprobs: int = 5
-        ) -> float:
+        ) -> list[float]:
         """
-        Compute the consistency score between two images.
+        Compute the consistency score between two images, for each given criterion.
         """
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": pil_image_to_base64(image1)}},
+        scores = []
+        for criterion_text in criterion_texts:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": pil_image_to_base64(image1)}},
                     {"type": "image_url", "image_url": {"url": pil_image_to_base64(image2)}},
                     {"type": "text", "text": f"Do images meet the following criteria? {criterion_text} Please answer Yes or No."},
                 ],
             }
-        ]
+            ]
 
-        # TODO: finish it
-        completion = self.client.chat.completions.create(
-            model_name=self.model_name,
-            messages=messages,
-            temperature=0.0, # Deterministic result,
-            max_completion_tokens=1,
-            logprobs=True,
-            top_logprobs=top_logprobs
-        )
-        log_probs = completion.choices[0].logprobs
-        if log_probs:
-            token_probs = {t.token.lower(): float(np.exp(t.logprob)) for t in log_probs.content[0].top_logprobs}
-            score = token_probs.get('yes', 0.0) # Other method to measure score?
-        else:
-            # log_prob cannot be derived here. How to calculate?
-            # TODO
-            score = 0.0
+            completion = self.client.chat.completions.create(
+                model_name=self.model_name,
+                messages=messages,
+                temperature=0.0, # Deterministic result,
+                max_completion_tokens=1,
+                logprobs=True,
+                top_logprobs=top_logprobs
+            )
+            log_probs = completion.choices[0].logprobs
+            if log_probs:
+                token_probs = {t.token.lower(): float(np.exp(t.logprob)) for t in log_probs.content[0].top_logprobs}
+                score = token_probs.get('yes', 0.0) # Other method to measure score?
+            else:
+                # log_prob cannot be derived here. How to calculate?
+                # TODO
+                score = 0.0
 
-        return score
+            scores.append(score)
+
+        return scores

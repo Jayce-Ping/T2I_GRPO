@@ -108,6 +108,28 @@ def imagereward_score(device):
 
     return _fn
 
+def consistency_score(device):
+    from flow_grpo.rewards.consistency_scorer import ConsistencyScorer
+
+    scorer = ConsistencyScorer(
+        api_key='dummy_key',
+        base_url='http://127.0.0.1:8000/v1',
+        model_name='QwenVL2.5-7B-Instruct',
+        criteria_path='dataset/T2IS/prompt_consistency_criterion.json'
+    )
+
+    def _fn(images, prompts, metadatas):
+        if isinstance(images, torch.Tensor):
+            images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+            images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
+            images = [Image.fromarray(image) for image in images]
+
+        scores = scorer(images, prompts, metadatas)
+        return scores, {}
+
+    return _fn
+
+
 def qwenvl_score(device):
     from flow_grpo.rewards.qwenvl import QwenVLScorer
 
