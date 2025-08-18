@@ -109,6 +109,7 @@ def imagereward_score(device):
     return _fn
 
 def consistency_score(device):
+    import asyncio
     from flow_grpo.rewards.consistency_scorer import ConsistencyScorer
 
     scorer = ConsistencyScorer(
@@ -124,7 +125,15 @@ def consistency_score(device):
             images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
             images = [Image.fromarray(image) for image in images]
 
-        scores = scorer(images, prompts, metadatas)
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                scorer(images, prompts, metadatas), loop
+            )
+            scores = future.result()
+        else:
+            scores = loop.run_until_complete(scorer(images, prompts, metadatas))
+
         return scores, {}
 
     return _fn
