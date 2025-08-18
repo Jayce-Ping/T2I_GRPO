@@ -137,11 +137,11 @@ def calculate_zero_std_ratio(prompts, gathered_rewards):
 
 def create_generator(prompts : List[str], base_seed : int) -> List[torch.Generator]:
     generators = []
-    for prompt in prompts:
+    for batch_pos, prompt in enumerate(prompts):
         # Use a stable hash (SHA256), then convert it to an integer seed
         hash_digest = hashlib.sha256(prompt.encode()).digest()
         prompt_hash_int = int.from_bytes(hash_digest[:4], 'big')  # Take the first 4 bytes as part of the seed
-        seed = (base_seed + prompt_hash_int) % (2**31) # Ensure the number is within a valid range
+        seed = (3**batch_pos + base_seed + prompt_hash_int) % (2**31) # Ensure the number is within a valid range
         gen = torch.Generator().manual_seed(seed)
         generators.append(gen)
     return generators
@@ -645,10 +645,10 @@ def main(_):
 
             # sample
             if not config.sample.same_latent:
-                # Different initial latent for each prompt
+                # Different seed
                 generator = create_generator(prompts, base_seed=epoch*10000+i)
             else:
-                # Same initial latent for each prompt - simply use seed
+                # Same initial latent seed
                 generator = [torch.Generator(device=accelerator.device).manual_seed(config.seed) for _ in range(len(prompts))]
             with autocast():
                 with torch.no_grad():

@@ -2,14 +2,6 @@ from typing import Optional
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 
-from typing import Optional
-import torch
-from diffusers import FlowMatchEulerDiscreteScheduler
-
-from typing import Optional
-import torch
-from diffusers import FlowMatchEulerDiscreteScheduler
-
 class FlowMatchSlidingWindowScheduler(FlowMatchEulerDiscreteScheduler):
     def __init__(
         self,
@@ -17,6 +9,7 @@ class FlowMatchSlidingWindowScheduler(FlowMatchEulerDiscreteScheduler):
         window_size: int = 1000,
         iters_per_group: int = 25,
         left_boundary : int = 0,
+        right_boundary : Optional[int] = None,
         sample_strategy: str = "progressive",
         prog_overlap_step: int = 1,
         roll_back: bool = False,
@@ -27,6 +20,7 @@ class FlowMatchSlidingWindowScheduler(FlowMatchEulerDiscreteScheduler):
         self.noise_level = noise_level
         self.iters_per_group = iters_per_group
         self.left_boundary = left_boundary
+        self.right_boundary = right_boundary if right_boundary is not None else self.config.num_train_timesteps - 1
         self.sample_strategy = sample_strategy
         self.prog_overlap_step = prog_overlap_step
         self.roll_back = roll_back
@@ -34,6 +28,7 @@ class FlowMatchSlidingWindowScheduler(FlowMatchEulerDiscreteScheduler):
         assert self.noise_level >= 0 and self.noise_level <= 1, "Noise level must be between 0 and 1."
         assert self._window_size > 0, "Window size must be greater than 0."
         assert self.left_boundary >= 0, "Left boundary must be non-negative."
+        assert self.right_boundary >= self.left_boundary, "Right boundary must be greater than or equal to left boundary."
         assert self.prog_overlap_step < self._window_size, "Progressive overlap step must be less than window size."
         assert self.sample_strategy in ["progressive", "random"], f"Sample strategy must be one of ['progressive', 'random']. {sample_strategy} is not supported."
 
@@ -42,8 +37,8 @@ class FlowMatchSlidingWindowScheduler(FlowMatchEulerDiscreteScheduler):
 
     @property
     def window_size(self):
-        if self._window_size > self.config.num_train_timesteps:
-            self._window_size = self.config.num_train_timesteps
+        if self._window_size > len(self.timesteps):
+            self._window_size = len(self.timesteps)
         
         return self._window_size
 
@@ -63,7 +58,7 @@ class FlowMatchSlidingWindowScheduler(FlowMatchEulerDiscreteScheduler):
             generator = torch.Generator()
             if seed is not None:
                 generator.manual_seed(seed)
-            self.cur_timestep = torch.randint(0, self.config.num_train_timesteps - self.window_size + 1, (1,), generator=generator).item()
+            self.cur_timestep = torch.randint(0, len(self.timesteps) - self.window_size + 1, (1,), generator=generator).item()
 
     def get_window_timesteps(self) -> torch.Tensor:
         start = self.cur_timestep
@@ -78,7 +73,7 @@ class FlowMatchSlidingWindowScheduler(FlowMatchEulerDiscreteScheduler):
     def get_noise_levels(self) -> torch.Tensor:
         """ Returns noise levels on all timesteps, where noise level is non-zero only within the current window. """
         window_indices = [self.index_for_timestep(t) for t in self.get_window_timesteps()]
-        noise_levels = torch.zeros(self.config.num_train_timesteps)
+        noise_levels = torch.zeros_like(self.timesteps, dtype=torch.float32)
         noise_levels[window_indices] = self.noise_level
         return noise_levels
     
@@ -86,7 +81,10 @@ class FlowMatchSlidingWindowScheduler(FlowMatchEulerDiscreteScheduler):
         """
             Return the noise level for a specific timestep.
         """
-        if self.left_boundary <= self.index_for_timestep(time_step) <= self.right_boundary:
+        time_step_index = self.index_for_timestep(time_step)
+        window_start = self.cur_timestep
+        window_end = min(self.cur_timestep + self.window_size, self.right_boundary)
+        if window_start <= time_step_index < window_end:
             return self.noise_level
 
         return 0.0

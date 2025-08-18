@@ -16,7 +16,7 @@ def denoising_step_with_logprob(
     sample: torch.FloatTensor,
     noise_level: float = 0.7,
     prev_sample: Optional[torch.FloatTensor] = None,
-    generator: Optional[torch.Generator] = None
+    generator: Optional[Union[torch.Generator, list[torch.Generator]]] = None
 ):
     """
     Predict the sample from the previous timestep by **reversing** the SDE. This function propagates the flow
