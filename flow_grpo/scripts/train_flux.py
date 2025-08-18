@@ -835,7 +835,7 @@ def main(_):
                 disable=not accelerator.is_local_main_process,
             ):
                 for j in tqdm(
-                    range(num_train_timesteps),
+                    range(pipeline.scheduler.left_boundary, num_train_timesteps),
                     desc="Timestep",
                     position=1,
                     leave=False,
