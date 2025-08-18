@@ -12,7 +12,7 @@ from ..scheduler import FlowMatchSlidingWindowScheduler
 def denoising_step_with_logprob(
     self: FlowMatchSlidingWindowScheduler,
     model_output: torch.FloatTensor,
-    timesteps: Union[float, torch.FloatTensor],
+    timestep: Union[list[float], torch.FloatTensor],
     sample: torch.FloatTensor,
     noise_level: float = 0.7,
     prev_sample: Optional[torch.FloatTensor] = None,
@@ -26,7 +26,7 @@ def denoising_step_with_logprob(
         model_output (`torch.FloatTensor`):
             The direct output from learned flow model.
         timestep (`float` | `torch.FloatTensor`):
-            The current discrete timestep(s) in the diffusion chain.
+            The current discrete timestep(s) in the diffusion chain, with batch dimension.
         sample (`torch.FloatTensor`):
             A current instance of a sample created by the diffusion process.
         noise_level (`float`):
@@ -41,14 +41,8 @@ def denoising_step_with_logprob(
     sample=sample.float()
     if prev_sample is not None:
         prev_sample=prev_sample.float()
-    if isinstance(timesteps, torch.FloatTensor):
-        timesteps = timesteps.float()
-    else:
-        timesteps = [timesteps]
 
-    assert isinstance(timesteps, list)
-
-    step_index = [self.index_for_timestep(t) for t in timesteps]
+    step_index = [self.index_for_timestep(t) for t in timestep]
     prev_step_index = [step + 1 for step in step_index]
     sigma = self.sigmas[step_index].view(-1, *([1] * (len(sample.shape) - 1))) # sigma is a decreasing sequence from 1 to 0, sigma=1 means pure noise, sigma=0 means pure data
     sigma_prev = self.sigmas[prev_step_index].view(-1, *([1] * (len(sample.shape) - 1)))
