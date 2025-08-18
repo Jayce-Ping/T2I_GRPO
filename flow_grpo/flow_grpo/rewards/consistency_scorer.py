@@ -113,7 +113,8 @@ class ConsistencyScorer:
                 dimension_scores[dimension].append(criterion_scores)
 
         # Compute average scores from each dimension
-        final_scores = np.array(zip(*dimension_scores.values()))
+        final_scores = np.array(list(zip(*dimension_scores.values())))
+
         return final_scores.mean(axis=(1,2)).tolist()
 
     def compute_image_consistency(
