@@ -79,18 +79,16 @@ class ConsistencyScorer:
     def __call__(self, images : list[Image.Image], prompts : list[str], metadatas : list[dict]) -> list[float]:
         assert len(prompts) == len(images), "Length of prompts and images must match"
 
-        dimension_scores : dict[str, list[list[float]]]= {
-            "Style": [],
-            "Identity": [],
-            "Logic": []
-        }
+        final_scores = []
         for prompt, image, metadata in zip(prompts, images, metadatas):
             grid_info = extract_grid_info(prompt)
             sub_images = divide_image(image, grid_info)
             criteria_info = self.criteria_data[metadata['idx']]
-    
+
+            dimensions = criteria_info.keys()
+            dimension_scores = {k:0.0 for k in dimensions}
             # Compute scores for each prompt-image pair from different dimensions
-            for dimension in ["Style", "Identity", "Logic"]:
+            for dimension in dimensions:
                 # Get criteria for this dimension
                 dimension_criteria = criteria_info[dimension][0]  # Get the first (and only) dictionary in the list
                 criterion_texts = list(dimension_criteria.values())
@@ -105,17 +103,20 @@ class ConsistencyScorer:
 
                         criterion_scores.append(scores)
 
-                # Transpose dimension_scores, to make each item is a list of scores for each criterion
+                # Transpose criterion_scores, to make each item is a list of scores for each criterion
                 criterion_scores = list(map(list, zip(*criterion_scores)))
+
                 # Compute the average score within each criterion
                 criterion_scores = [sum(scores) / len(scores) if scores else 0.0 for scores in criterion_scores]
 
-                dimension_scores[dimension].append(criterion_scores)
+                # Compute the overall score for this dimension
+                overall_score = sum(criterion_scores) / len(criterion_scores) if criterion_scores else 0.0
+                dimension_scores[dimension] = overall_score
 
-        # Compute average scores from each dimension
-        final_scores = np.array(list(zip(*dimension_scores.values())))
+            # Compute average scores from each dimension
+            final_scores.append(sum(dimension_scores.values()) / len(dimension_scores))
 
-        return final_scores.mean(axis=(1,2)).tolist()
+        return final_scores
 
     def compute_image_consistency(
             self,
