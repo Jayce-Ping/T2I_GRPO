@@ -141,7 +141,7 @@ def create_generator(prompts : List[str], base_seed : int) -> List[torch.Generat
         # Use a stable hash (SHA256), then convert it to an integer seed
         hash_digest = hashlib.sha256(prompt.encode()).digest()
         prompt_hash_int = int.from_bytes(hash_digest[:4], 'big')  # Take the first 4 bytes as part of the seed
-        seed = (3**batch_pos + base_seed + prompt_hash_int) % (2**31) # Ensure the number is within a valid range
+        seed = (base_seed + prompt_hash_int) % (2**31) # Ensure the number is within a valid range
         gen = torch.Generator().manual_seed(seed)
         generators.append(gen)
     return generators
@@ -644,12 +644,12 @@ def main(_):
             ).input_ids.to(accelerator.device)
 
             # sample
-            if not config.sample.same_latent:
-                # Different seed
+            if config.sample.same_latent:
+                # Same seed for same prompt
                 generator = create_generator(prompts, base_seed=epoch*10000+i)
             else:
                 # Same initial latent seed
-                generator = [torch.Generator(device=accelerator.device).manual_seed(config.seed) for _ in range(len(prompts))]
+                generator = None
             with autocast():
                 with torch.no_grad():
                     images, latents, image_ids, text_ids, log_probs = pipeline_with_logprob(
