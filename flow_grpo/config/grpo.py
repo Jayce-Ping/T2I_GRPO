@@ -481,8 +481,8 @@ def consistency_flux_8gpu():
 
     # flux
     config.pretrained.model = FLUX_MODEL_PATH
-    config.sample.num_steps = 10
-    config.sample.eval_num_steps = 10
+    config.sample.num_steps = 12
+    config.sample.eval_num_steps = 12
     config.sample.guidance_scale = 3.5
 
     config.resolution = 1024

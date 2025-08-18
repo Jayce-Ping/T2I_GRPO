@@ -80,7 +80,7 @@ class ConsistencyScorer:
         self.openai_api_key = api_key
         self.openai_base_url = base_url
         self.model_name = model_name
-        self.async_model = async_mode
+        self.async_mode = async_mode
 
 
         if async_mode:
@@ -100,7 +100,7 @@ class ConsistencyScorer:
 
 
     @torch.no_grad()
-    def __call__(self, images : list[Image.Image], prompts : list[str], metadatas : list[dict]) -> list[float]:
+    async def __call__(self, images : list[Image.Image], prompts : list[str], metadatas : list[dict]) -> list[float]:
         assert len(prompts) == len(images), "Length of prompts and images must match"
 
         final_scores = []
@@ -116,7 +116,10 @@ class ConsistencyScorer:
                 criteria_texts = list(dimension_criteria.values())
 
                 # [criteria1_scores : list[float], criteria2_scores : list[float], ...]
-                criterion_scores = [self.compute_image_consistency(prompt, image, ct) for ct in criteria_texts]
+                criterion_scores = []
+                for ct in criteria_texts:
+                    scores = await self.compute_image_consistency(prompt, image, ct)
+                    criterion_scores.append(scores)
 
                 # Compute the average score within each criterion
                 # [criteria1_avg_score, criteria2_avg_score, ...]
@@ -132,15 +135,15 @@ class ConsistencyScorer:
         return final_scores
     
 
-    def compute_image_consistency(
+    async def compute_image_consistency(
             self,
             prompt : str,
             image : Image.Image,
             criteria_text : str,
             top_logprobs: int = 5
-        ):
-        if self.async_model:
-            return asyncio.run(self._async_compute_image_consistency(prompt, image, criteria_text, top_logprobs))
+        ) -> list[float]:
+        if self.async_mode:
+            return await self._async_compute_image_consistency(prompt, image, criteria_text, top_logprobs)
         else:
             return self._sync_compute_image_consistency(prompt, image, criteria_text, top_logprobs)
 
@@ -150,11 +153,11 @@ class ConsistencyScorer:
             image : Image.Image,
             criteria_text : str,
             top_logprobs: int = 5
-        ):
+        ) -> list[float]:
         """
         Async version of compute_image_consistency.
         """
-        completions = []
+        tasks = []
         grid_info = extract_grid_info(prompt)
         sub_images = divide_image(image, grid_info)
         for image1, image2 in combinations(sub_images, 2):
@@ -179,12 +182,12 @@ class ConsistencyScorer:
                 top_logprobs=top_logprobs
             )
 
-            completions.append(completion)
+            tasks.append(completion)
 
 
-        res = await asyncio.gather(*completions)
+        completions = await asyncio.gather(*tasks)
 
-        return [get_score_from_completion(c) for c in res]
+        return [get_score_from_completion(c) for c in completions]
 
 
     def _sync_compute_image_consistency(
