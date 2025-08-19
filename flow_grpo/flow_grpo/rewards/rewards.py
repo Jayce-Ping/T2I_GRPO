@@ -125,14 +125,7 @@ def consistency_score(device):
             images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
             images = [Image.fromarray(image) for image in images]
 
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(
-                scorer(images, prompts, metadatas), loop
-            )
-            scores = future.result()
-        else:
-            scores = loop.run_until_complete(scorer(images, prompts, metadatas))
+        scores = asyncio.run(scorer(images, prompts, metadatas))
 
         return scores, {}
 
