@@ -62,8 +62,8 @@ def get_score_from_completion(completion : openai.ChatCompletion) -> float:
         # Compute score = P('yes') / (P('yes') + P('no'))
         # 1. Use logprobs
         token_logprobs = {t.token.lower().replace(" ", ""): t.logprob for t in logprobs.content[0].top_logprobs}
-        yes_logprob = token_logprobs.get('yes', 0.0)
-        no_logprob = token_logprobs.get('no', 0.0)
+        yes_logprob = token_logprobs.get('yes', -math.inf)
+        no_logprob = token_logprobs.get('no', -math.inf)
         score = 1 / (1 + math.exp(no_logprob - yes_logprob)) # Same formular for logits as well. Since the sum term will cancel out.
 
         # 2. Use probabilities
