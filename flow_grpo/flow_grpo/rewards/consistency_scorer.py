@@ -124,7 +124,7 @@ class ConsistencyScorer:
             for dimension in dimensions:
                 # Get criteria for this dimension
                 dimension_criteria = criteria_info[dimension][0]  # Get the first (and only) dictionary in the list
-                criteria_texts = list(dimension_criteria.values())
+                criteria_texts = [c_t for c_t in dimension_criteria.values() if c_t]
 
                 # [criteria1_scores : list[float], criteria2_scores : list[float], ...]
                 criterion_scores = []
