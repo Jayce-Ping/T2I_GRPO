@@ -7,6 +7,7 @@ import base64
 import logging
 import asyncio
 from itertools import combinations
+import math
 
 import torch
 import numpy as np
@@ -58,12 +59,23 @@ def extract_grid_info(prompt) -> tuple[int, int]:
 def get_score_from_completion(completion : openai.ChatCompletion) -> float:
     logprobs = completion.choices[0].logprobs
     if logprobs:
-        token_probs = {t.token.lower().replace(" ", ""): float(np.exp(t.logprob)) for t in logprobs.content[0].top_logprobs}
-        score = token_probs.get('yes', 0.0) # Other method to measure score?
+        # Compute score = P('yes') / (P('yes') + P('no'))
+        # 1. Use logprobs
+        token_logprobs = {t.token.lower().replace(" ", ""): t.logprob for t in logprobs.content[0].top_logprobs}
+        yes_logprob = token_logprobs.get('yes', 0.0)
+        no_logprob = token_logprobs.get('no', 0.0)
+        score = 1 / (1 + math.exp(no_logprob - yes_logprob)) # Same formular for logits as well. Since the sum term will cancel out.
+
+        # 2. Use probabilities
+        # token_probs = {t : float(np.exp(lp)) for t, lp in token_logprobs.items()}
+        # yes_prob = token_probs.get('yes', 0.0)
+        # no_prob = token_probs.get('no', 0.0)
+        # ratio = no_prob / yes_prob if yes_prob > 0 else 1.0
+        # score = 1 / (1 + ratio)
     else:
         # log_prob cannot be derived here. How to calculate?
         # TODO
-        score = 0.0
+        score = 0.5
 
     return score
 

@@ -433,6 +433,7 @@ def qwenvl_flux_8gpu():
     # Sliding Window Scheduler
     config.use_sliding_window = False
     config.window_size = 4
+    config.left_boundary = 0
 
     # flux
     config.pretrained.model = FLUX_MODEL_PATH
