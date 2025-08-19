@@ -58,7 +58,7 @@ def extract_grid_info(prompt) -> tuple[int, int]:
 def get_score_from_completion(completion : openai.ChatCompletion) -> float:
     logprobs = completion.choices[0].logprobs
     if logprobs:
-        token_probs = {t.token.lower(): float(np.exp(t.logprob)) for t in logprobs.content[0].top_logprobs}
+        token_probs = {t.token.lower().replace(" ", ""): float(np.exp(t.logprob)) for t in logprobs.content[0].top_logprobs}
         score = token_probs.get('yes', 0.0) # Other method to measure score?
     else:
         # log_prob cannot be derived here. How to calculate?
