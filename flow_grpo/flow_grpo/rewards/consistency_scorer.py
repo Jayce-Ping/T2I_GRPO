@@ -84,14 +84,14 @@ class ConsistencyScorer:
             self,
             api_key='dummy_key',
             base_url='http://127.0.0.1:8000/v1',
-            model_name='QwenVL2.5-7B-Instruct',
+            model='QwenVL2.5-7B-Instruct',
             criteria_path='prompt_consistency_criterion.json',
             async_mode=True,
             max_concurrent=12,  # 2x2 grid has 6 pair of images to compare. 12 for at most 2 batches at once.
         ):
         self.openai_api_key = api_key
         self.openai_base_url = base_url
-        self.model_name = model_name
+        self.model = model
         self.async_mode = async_mode
         self.max_concurrent = max_concurrent
 
@@ -170,7 +170,9 @@ class ConsistencyScorer:
             prompt : str,
             image : Image.Image,
             criteria_text : str,
-            top_logprobs: int = 10
+            top_logprobs: int = 10,
+            max_retries : int = 5,
+            timeout : float = 60.0
         ) -> list[float]:
         """
         Async version of compute_image_consistency with concurrency control.
@@ -187,17 +189,25 @@ class ConsistencyScorer:
                     ]
                 }
             ]
+            for attempt in range(max_retries):
+                try:
+                    completion = await self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        temperature=0.0, # Deterministic result, no use for logprobs, actually.
+                        max_completion_tokens=1,
+                        logprobs=True,
+                        top_logprobs=top_logprobs,
+                        timeout=timeout
+                    )
+                    return completion
+                except Exception as e:
+                    print(f"API error on attempt {attempt+1}/{max_retries}: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        return None
 
-            completion = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=0.0, # Deterministic result, no use for logprobs, actually.
-                max_completion_tokens=1,
-                logprobs=True,
-                top_logprobs=top_logprobs
-            )
-            
-            return completion
 
         grid_info = extract_grid_info(prompt)
         sub_images = divide_image(image, grid_info)
@@ -240,7 +250,7 @@ class ConsistencyScorer:
             ]
 
             completion = self.client.chat.completions.create(
-                model=self.model_name,
+                model=self.model,
                 messages=messages,
                 temperature=0.0, # Deterministic result,
                 max_completion_tokens=1,
