@@ -87,7 +87,7 @@ class ConsistencyScorer:
             model_name='QwenVL2.5-7B-Instruct',
             criteria_path='prompt_consistency_criterion.json',
             async_mode=True,
-            max_concurrent=24 # 2x2 grid has 6 pair of images to compare. 24 for at most 4 batches at once.
+            max_concurrent=12,  # 2x2 grid has 6 pair of images to compare. 12 for at most 2 batches at once.
         ):
         self.openai_api_key = api_key
         self.openai_base_url = base_url
