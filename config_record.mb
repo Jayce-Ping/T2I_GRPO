@@ -6,8 +6,8 @@ Train时有 18~20 的余量。
 
 VLLM COnfig:
 ```yaml
-max-model-len: 2048
-mem_required: 36G (4*A100 with 0.1 gpu-mem-utils)
+max-model-len: 3096
+mem_required: 36G (4*A100 with 0.1 gpu-mem-utils)✅
 ```
 
 Flow-GRPO Config:
