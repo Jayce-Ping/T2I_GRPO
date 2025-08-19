@@ -59,19 +59,18 @@ def extract_grid_info(prompt) -> tuple[int, int]:
 def get_score_from_completion(completion : openai.ChatCompletion) -> float:
     logprobs = completion.choices[0].logprobs
     if logprobs:
-        # Compute score = P('yes') / (P('yes') + P('no'))
-        # 1. Use logprobs
+        # Use logprobs to compute, score = P('yes') / (P('yes') + P('no'))
+        # score = 1 / (1 + exp(logprob('no') -  logprob('yes')))
+        # Same formular for logits as well. Since the sum term will cancel out.
         token_logprobs = {t.token.lower().replace(" ", ""): t.logprob for t in logprobs.content[0].top_logprobs}
-        yes_logprob = token_logprobs.get('yes', -math.inf)
-        no_logprob = token_logprobs.get('no', -math.inf)
-        score = 1 / (1 + math.exp(no_logprob - yes_logprob)) # Same formular for logits as well. Since the sum term will cancel out.
+        yes_logprob = token_logprobs.get('yes', float('-inf'))
+        no_logprob = token_logprobs.get('no', float('-inf'))
 
-        # 2. Use probabilities
-        # token_probs = {t : float(np.exp(lp)) for t, lp in token_logprobs.items()}
-        # yes_prob = token_probs.get('yes', 0.0)
-        # no_prob = token_probs.get('no', 0.0)
-        # ratio = no_prob / yes_prob if yes_prob > 0 else 1.0
-        # score = 1 / (1 + ratio)
+        if yes_logprob == float('-inf') or no_logprob == float('-inf'):
+            score = 0.5
+        else:
+            diff = torch.tensor(yes_logprob - no_logprob, dtype=torch.float64)
+            score = torch.sigmoid(diff).item()
     else:
         # log_prob cannot be derived here. How to calculate?
         # TODO
@@ -152,7 +151,7 @@ class ConsistencyScorer:
             prompt : str,
             image : Image.Image,
             criteria_text : str,
-            top_logprobs: int = 5
+            top_logprobs: int = 10
         ) -> list[float]:
         if self.async_mode:
             return await self._async_compute_image_consistency(prompt, image, criteria_text, top_logprobs)
@@ -164,7 +163,7 @@ class ConsistencyScorer:
             prompt : str,
             image : Image.Image,
             criteria_text : str,
-            top_logprobs: int = 5
+            top_logprobs: int = 10
         ) -> list[float]:
         """
         Async version of compute_image_consistency.
@@ -207,7 +206,7 @@ class ConsistencyScorer:
             prompt : str,
             image : Image.Image,
             criteria_text : str,
-            top_logprobs: int = 5
+            top_logprobs: int = 10
         ) -> list[float]:
         """
         Compute the consistency score of a image, for a given criterion.
