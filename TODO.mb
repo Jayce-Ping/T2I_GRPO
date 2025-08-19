@@ -41,7 +41,12 @@
 
 
 - Add noise level control. noise_level = 0 gives deterministic denoising process.
-Use noise_level to control determinism. Scheduler has been done?
-Function pipeline_with_log_prob needs to accecpt different noise_level for each time_step, rather than the same.
+Use noise_level to control determinism. Scheduler has been done? ✅
+Function pipeline_with_log_prob needs to accecpt different noise_level for each time_step, rather than the same. ✅
 
-- How to get log_probs when using API?
+- How to get log_probs when using API? ✅
+
+# 8.19
+
+- Why flow_grpo's sampler needs k divides n*bs, where k is the num-of-images-per-prompt, n is number of processes (gpus) and bs is train_batch_size
+> **Optimize it**
