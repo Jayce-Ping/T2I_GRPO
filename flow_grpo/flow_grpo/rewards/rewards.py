@@ -116,7 +116,8 @@ def consistency_score(device):
         api_key='dummy_key',
         base_url='http://127.0.0.1:8000/v1',
         model_name='QwenVL2.5-7B-Instruct',
-        criteria_path='dataset/T2IS/prompt_consistency_criterion.json'
+        criteria_path='dataset/T2IS/prompt_consistency_criterion.json',
+        max_concurrent=24
     )
 
     def _fn(images, prompts, metadatas):

@@ -86,13 +86,14 @@ class ConsistencyScorer:
             base_url='http://127.0.0.1:8000/v1',
             model_name='QwenVL2.5-7B-Instruct',
             criteria_path='prompt_consistency_criterion.json',
-            async_mode=True
+            async_mode=True,
+            max_concurrent=24 # 2x2 grid has 6 pair of images to compare. 24 for at most 4 batches at once.
         ):
         self.openai_api_key = api_key
         self.openai_base_url = base_url
         self.model_name = model_name
         self.async_mode = async_mode
-
+        self.max_concurrent = max_concurrent
 
         if async_mode:
             self.client = AsyncOpenAI(
@@ -105,47 +106,53 @@ class ConsistencyScorer:
                 base_url=self.openai_base_url
             )
 
-
         with open(criteria_path, 'r') as f:
             self.criteria_data = json.load(f)
-
 
     @torch.no_grad()
     async def __call__(self, images : list[Image.Image], prompts : list[str], metadatas : list[dict]) -> list[float]:
         assert len(prompts) == len(images), "Length of prompts and images must match"
 
-        final_scores = []
-        for prompt, image, metadata in zip(prompts, images, metadatas):
-            criteria_info = self.criteria_data[metadata['idx']]
+        # Create a global semaphore for overall concurrency control
+        global_semaphore = asyncio.Semaphore(self.max_concurrent)
+        
+        async def process_single_image(prompt, image, metadata):
+            async with global_semaphore:
+                criteria_info = self.criteria_data[metadata['idx']]
+                dimensions = criteria_info.keys()
+                dimension_scores = {k:0.0 for k in dimensions}
+                
+                # Compute scores for each prompt-image pair from different dimensions
+                for dimension in dimensions:
+                    # Get criteria for this dimension
+                    dimension_criteria = criteria_info[dimension][0]
+                    criteria_texts = [c_t for c_t in dimension_criteria.values() if c_t]
 
-            dimensions = criteria_info.keys()
-            dimension_scores = {k:0.0 for k in dimensions}
-            # Compute scores for each prompt-image pair from different dimensions
-            for dimension in dimensions:
-                # Get criteria for this dimension
-                dimension_criteria = criteria_info[dimension][0]  # Get the first (and only) dictionary in the list
-                criteria_texts = [c_t for c_t in dimension_criteria.values() if c_t]
+                    # [criteria1_scores : list[float], criteria2_scores : list[float], ...]
+                    criterion_scores = []
+                    for ct in criteria_texts:
+                        scores = await self.compute_image_consistency(prompt, image, ct)
+                        criterion_scores.append(scores)
 
-                # [criteria1_scores : list[float], criteria2_scores : list[float], ...]
-                criterion_scores = []
-                for ct in criteria_texts:
-                    scores = await self.compute_image_consistency(prompt, image, ct)
-                    criterion_scores.append(scores)
+                    # Compute the average score within each criterion
+                    criterion_scores = [sum(scores) / len(scores) if scores else 0.0 for scores in criterion_scores]
 
-                # Compute the average score within each criterion
-                # [criteria1_avg_score, criteria2_avg_score, ...]
-                criterion_scores = [sum(scores) / len(scores) if scores else 0.0 for scores in criterion_scores]
+                    # Compute the overall score for this dimension
+                    overall_score = sum(criterion_scores) / len(criterion_scores) if criterion_scores else 0.0
+                    dimension_scores[dimension] = overall_score
 
-                # Compute the overall score for this dimension
-                overall_score = sum(criterion_scores) / len(criterion_scores) if criterion_scores else 0.0
-                dimension_scores[dimension] = overall_score
+                # Compute average scores from each dimension
+                return sum(dimension_scores.values()) / len(dimension_scores)
 
-            # Compute average scores from each dimension
-            final_scores.append(sum(dimension_scores.values()) / len(dimension_scores))
-
+        # Process all images concurrently
+        tasks = [
+            process_single_image(prompt, image, metadata) 
+            for prompt, image, metadata in zip(prompts, images, metadatas)
+        ]
+        
+        final_scores = await asyncio.gather(*tasks)
         return final_scores
     
-
     async def compute_image_consistency(
             self,
             prompt : str,
@@ -166,12 +173,9 @@ class ConsistencyScorer:
             top_logprobs: int = 10
         ) -> list[float]:
         """
-        Async version of compute_image_consistency.
+        Async version of compute_image_consistency with concurrency control.
         """
-        tasks = []
-        grid_info = extract_grid_info(prompt)
-        sub_images = divide_image(image, grid_info)
-        for image1, image2 in combinations(sub_images, 2):
+        async def process_image_pair(image1, image2):
             messages = [
                 {
                     "role": "user",
@@ -184,22 +188,30 @@ class ConsistencyScorer:
                 }
             ]
 
-            completion = self.client.chat.completions.create(
+            completion = await self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
-                temperature=0.0, # Deterministic result,
+                temperature=0.0, # Deterministic result, no use for logprobs, actually.
                 max_completion_tokens=1,
                 logprobs=True,
                 top_logprobs=top_logprobs
             )
+            
+            return completion
 
-            tasks.append(completion)
+        grid_info = extract_grid_info(prompt)
+        sub_images = divide_image(image, grid_info)
+        
+        # Create tasks for all image pairs (no additional semaphore here since global control is in __call__)
+        tasks = []
+        for image1, image2 in combinations(sub_images, 2):
+            task = process_image_pair(image1, image2)
+            tasks.append(task)
 
-
+        # Execute all tasks concurrently
         completions = await asyncio.gather(*tasks)
 
         return [get_score_from_completion(c) for c in completions]
-
 
     def _sync_compute_image_consistency(
             self,
@@ -237,6 +249,5 @@ class ConsistencyScorer:
             )
 
             completions.append(completion)
-
 
         return [get_score_from_completion(c) for c in completions]
